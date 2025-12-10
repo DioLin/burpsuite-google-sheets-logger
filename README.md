@@ -4,6 +4,44 @@
 
 這是一個 Burp Suite 擴充套件，用於將 HTTP 請求的參數和完整請求內容自動記錄到 Google Sheets 中。擴充套件支援從 gcloud CLI 獲取認證 token，並提供智能的空行查找和數據覆蓋保護機制。
 
+## 前置需求
+
+1. **Burp Suite Professional** 或 **Community Edition**
+2. **Google Cloud SDK (gcloud CLI)** 已安裝並配置
+
+#### 安裝 Google Cloud CLI (Windows)
+
+前往 Google 官方文件下載 Google Cloud CLI Installer for Windows：
+👉 [點此下載 gcloud CLI 安裝程式 (.exe)](https://cloud.google.com/sdk/docs/install)
+
+#### 初始化專案與權限 (關鍵設定)
+
+執行以下命令來初始化專案並設定必要的權限：
+
+```bash
+# 1. 登入並設定應用程式預設憑證（包含必要的 API 範圍）
+gcloud auth application-default login --scopes=https://www.googleapis.com/auth/spreadsheets,https://www.googleapis.com/auth/cloud-platform
+
+# 2. 創建新的 Google Cloud 專案（名稱可自訂，例如：chtpt-burp-logger-001）
+gcloud projects create chtpt-burp-logger-00X
+
+# 3. 設定應用程式預設憑證的配額專案（使用步驟 2 創建的專案名稱）
+gcloud auth application-default set-quota-project chtpt-burp-logger-00X
+
+# 4. 啟用 Google Sheets API（使用步驟 2 創建的專案名稱）
+gcloud services enable sheets.googleapis.com --project chtpt-burp-logger-00X
+
+# 5. 驗證 token 是否正常運作（可選，用於測試）
+gcloud auth application-default print-access-token
+```
+
+**注意事項**：
+- 步驟 2 中的專案名稱（`chtpt-burp-logger-00X`）可以自訂，但請確保在所有後續步驟中使用相同的專案名稱
+- 如果專案已存在，步驟 2 會失敗，可以直接跳過並使用現有專案名稱
+- 步驟 5 會輸出一個 access token，如果看到 token 輸出表示設定成功
+
+3. **Google Sheets** 文件已創建，並具有適當的權限
+
 ## 主要功能
 
 ### 1. HTTP 請求記錄
@@ -194,47 +232,12 @@ BurpExtender (主類別)
 
 ## 安裝與使用
 
-### 前置需求
-
-1. **Burp Suite Professional** 或 **Community Edition**
-2. **Google Cloud SDK (gcloud CLI)** 已安裝並配置
-
-#### 安裝 Google Cloud CLI (Windows)
-
-前往 Google 官方文件下載 Google Cloud CLI Installer for Windows：
-👉 [點此下載 gcloud CLI 安裝程式 (.exe)](https://cloud.google.com/sdk/docs/install)
-
-#### 初始化專案與權限 (關鍵設定)
-
-執行以下命令來初始化專案並設定必要的權限：
-
-```bash
-# 1. 登入並設定應用程式預設憑證（包含必要的 API 範圍）
-gcloud auth application-default login --scopes=https://www.googleapis.com/auth/spreadsheets,https://www.googleapis.com/auth/cloud-platform
-
-# 2. 創建新的 Google Cloud 專案（名稱可自訂，例如：chtpt-burp-logger-001）
-gcloud projects create chtpt-burp-logger-00X
-
-# 3. 設定應用程式預設憑證的配額專案（使用步驟 2 創建的專案名稱）
-gcloud auth application-default set-quota-project chtpt-burp-logger-00X
-
-# 4. 啟用 Google Sheets API（使用步驟 2 創建的專案名稱）
-gcloud services enable sheets.googleapis.com --project chtpt-burp-logger-00X
-
-# 5. 驗證 token 是否正常運作（可選，用於測試）
-gcloud auth application-default print-access-token
-```
-
-**注意事項**：
-- 步驟 2 中的專案名稱（`chtpt-burp-logger-00X`）可以自訂，但請確保在所有後續步驟中使用相同的專案名稱
-- 如果專案已存在，步驟 2 會失敗，可以直接跳過並使用現有專案名稱
-- 步驟 5 會輸出一個 access token，如果看到 token 輸出表示設定成功
-
-3. **Google Sheets** 文件已創建，並具有適當的權限
-
 ### 安裝步驟
 
 1. 將 `gform_logger_gcloud_v5.py` 複製到本地目錄
+   - **重要**: 請確保文件路徑**不包含中文字符或特殊字符**
+   - 建議路徑範例：`C:\BurpExtensions\gform_logger_gcloud_v5.py` 或 `D:\tools\gform_logger_gcloud_v5.py`
+   - 避免使用包含中文的路徑，例如：`C:\Users\...\Documents\01_資料夾\...`（可能會導致載入失敗）
 2. 在 Burp Suite 中：
    - 進入 `Extender` → `Extensions` → `Add`
    - 選擇 `Extension type: Python`
@@ -305,10 +308,45 @@ gcloud auth application-default print-access-token
 - 查看 Burp Suite 輸出標籤中的 DEBUG 訊息
 
 #### 2. 權限錯誤 (403 Forbidden)
-**錯誤訊息**: `權限錯誤 (403): Permission denied`
+
+##### 2.1 Google Sheets API 未啟用
+**錯誤訊息**: 
+```
+Google Sheets API has not been used in project {project_id} before or it is disabled. 
+Enable it by visiting https://console.developers.google.com/apis/api/sheets.googleapis.com/overview?project={project_id}
+```
+
+**問題原因**:
+- Google Sheets API 在指定的 Google Cloud Project 中未啟用
+- 或 API 剛啟用但還未完成系統傳播（通常需要幾分鐘）
 
 **解決方案**:
-1. 確認 Google Cloud Project 已啟用 Google Sheets API
+1. **使用 gcloud 命令啟用 API**（推薦）：
+   ```bash
+   gcloud services enable sheets.googleapis.com --project chtpt-burp-logger-050
+   ```
+   （將 `chtpt-burp-logger-050` 替換為您的實際專案 ID）
+
+2. **或透過網頁控制台啟用**：
+   - 前往錯誤訊息中提供的連結（例如：https://console.developers.google.com/apis/api/sheets.googleapis.com/overview?project=chtpt-burp-logger-050）
+   - 點擊「啟用」按鈕
+   - 等待 1-3 分鐘讓 API 啟用狀態傳播到系統
+
+3. **驗證 API 是否已啟用**：
+   ```bash
+   gcloud services list --enabled --project chtpt-burp-logger-050 | grep sheets
+   ```
+   如果看到 `sheets.googleapis.com` 表示已啟用
+
+4. **確認專案 ID 正確**：
+   - 檢查 Burp Suite 配置中的「GCP Project ID」是否與啟用 API 的專案一致
+   - 檢查 token 對應的專案是否正確設定了 quota project
+
+##### 2.2 一般權限錯誤
+**錯誤訊息**: `權限錯誤 (403): Permission denied`（非 API 未啟用）
+
+**解決方案**:
+1. 確認 Google Cloud Project 已啟用 Google Sheets API（參考上述步驟）
 2. 確認 Service Account 或 User Account 具有以下權限：
    - `roles/serviceusage.serviceUsageConsumer`
    - 或 `serviceusage.services.use`
@@ -338,6 +376,34 @@ gcloud auth application-default print-access-token
 **解決方案**:
 - 程式已內建 `safe_unicode_convert()` 函數處理此問題
 - 如果仍出現錯誤，請檢查輸入數據的編碼格式
+
+#### 6. 路徑錯誤 (Invalid argument)
+**錯誤訊息**: 
+```
+OSError: (22, 'Invalid argument', 'C:\\Users\\...\\01_??\\burpsuite-google-sheets-logger-main')
+```
+
+**問題原因**:
+- 腳本文件所在路徑包含**中文字符或特殊字符**
+- Jython 在 Windows 上無法正確處理包含某些特殊字符的路徑
+
+**解決方案**:
+1. **將文件移到不包含中文字符的路徑**：
+   - 建議路徑：`C:\BurpExtensions\gform_logger_gcloud_v5.py`
+   - 或：`D:\tools\burpsuite\gform_logger_gcloud_v5.py`
+   - 避免：`C:\Users\...\Documents\01_資料夾\...` ❌
+   
+2. **檢查文件夾名稱**：
+   - 確保所有父目錄名稱都使用 ASCII 字符（英文、數字、底線、連字號）
+   - 如果路徑中包含中文或其他特殊字符，請重命名文件夾或移動文件
+
+3. **重新載入擴展**：
+   - 在 Burp Suite 中移除舊的擴展
+   - 使用新的路徑重新添加擴展
+
+**預防措施**:
+- 創建專用的擴展目錄，使用純英文路徑
+- 例如：`C:\BurpExtensions\` 或 `D:\SecurityTools\BurpExtensions\`
 
 ## 調試資訊
 
