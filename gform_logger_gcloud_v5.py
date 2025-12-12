@@ -2,7 +2,7 @@
 from burp import IBurpExtender
 from burp import IContextMenuFactory
 from burp import IParameter
-from javax.swing import JMenuItem, JOptionPane, JPanel, JLabel, JTextField, Box, BoxLayout, JTextArea, JScrollPane, JButton, JComboBox
+from javax.swing import JMenuItem, JOptionPane, JPanel, JLabel, JTextField, Box, BoxLayout, JTextArea, JScrollPane, JButton, JComboBox, ButtonGroup, JRadioButton
 from java.util import ArrayList
 from java.awt import Dimension
 from java.lang import ProcessBuilder, Runtime
@@ -13,7 +13,11 @@ import json
 import os
 import time
 import codecs
+import base64
+import random
+import string
 from java.io import BufferedReader, InputStreamReader, File
+from java.net import ServerSocket, Socket, URI
 
 def safe_unicode_convert(val):
     """安全地將各種類型的值轉換為 Unicode"""
@@ -63,9 +67,14 @@ class BurpExtender(IBurpExtender, IContextMenuFactory):
         self.config = {
             "sheet_id": "",
             "access_token": "",
+            "refresh_token": "",
             "project_id": "chtpt-burp-logger-001",
             "sheet_name": u"弱點清單",
-            "email": ""
+            "email": "",
+            "auth_method": "gcloud",  # "gcloud" or "oauth2"
+            "oauth2_client_id": "",
+            "oauth2_client_secret": "",
+            "token_expires_at": 0  # Unix timestamp
         }
         
         # 載入已保存的配置
@@ -78,12 +87,15 @@ class BurpExtender(IBurpExtender, IContextMenuFactory):
         self.context = invocation
         menu_list = ArrayList()
         menu_send = JMenuItem(u"[G-Sheet] Send to I/J/K/O/P", actionPerformed=self.send_to_sheet)
-        menu_config = JMenuItem(u"[G-Sheet] Configuration", actionPerformed=self.show_config_dialog)
+        menu_gcloud_config = JMenuItem(u"[G-Sheet] Google CLI Configuration", actionPerformed=self.show_gcloud_config_dialog)
+        menu_oauth2_config = JMenuItem(u"[G-Sheet] OAuth 2.0 Configuration", actionPerformed=self.show_oauth2_config_dialog)
         menu_list.add(menu_send)
-        menu_list.add(menu_config)
+        menu_list.add(menu_gcloud_config)
+        menu_list.add(menu_oauth2_config)
         return menu_list
 
-    def show_config_dialog(self, event=None):
+    def show_gcloud_config_dialog(self, event=None):
+        """Google CLI Configuration 對話框"""
         panel = JPanel()
         panel.setLayout(BoxLayout(panel, BoxLayout.Y_AXIS))
         
@@ -98,7 +110,7 @@ class BurpExtender(IBurpExtender, IContextMenuFactory):
         # 顯示當前 token 的 email（優先使用配置中的 email）
         token_email_label = JLabel(u"")
         current_email = self.config.get("email", "")
-        if self.config.get("access_token"):
+        if self.config.get("access_token") and self.config.get("auth_method", "gcloud") == "gcloud":
             # 優先使用配置中已保存的 email
             if current_email:
                 token_email_label.setText(u"當前 Token Email: " + current_email)
@@ -116,9 +128,8 @@ class BurpExtender(IBurpExtender, IContextMenuFactory):
         else:
             token_email_label.setText(u"當前 Token Email: 未設置")
         
-        # 查詢 Spreadsheet 列表相關組件（需要在 btn_get_token 之前定義）
+        # 查詢 Spreadsheet 列表相關組件
         txt_query_email = JTextField(current_email, 40)
-        
         btn_get_token = JButton(u"從 gcloud 獲取 Token", actionPerformed=self._create_token_fetcher(txt_token, txt_query_email))
         combo_sheets = JComboBox([u"請先查詢 Spreadsheet 列表"])
         combo_sheets.setEnabled(False)
@@ -145,6 +156,8 @@ class BurpExtender(IBurpExtender, IContextMenuFactory):
         
         combo_sheets.addActionListener(on_combo_change)
         
+        panel.add(JLabel(u"認證方式: gcloud CLI"))
+        panel.add(Box.createVerticalStrut(5))
         panel.add(JLabel(u"查詢 Email:"))
         panel.add(txt_query_email)
         panel.add(Box.createVerticalStrut(5))
@@ -169,43 +182,218 @@ class BurpExtender(IBurpExtender, IContextMenuFactory):
         panel.add(Box.createVerticalStrut(5))
         panel.add(btn_get_token)
 
-        result = JOptionPane.showConfirmDialog(None, panel, u"API Settings", JOptionPane.OK_CANCEL_OPTION)
+        result = JOptionPane.showConfirmDialog(None, panel, u"Google CLI Configuration", JOptionPane.OK_CANCEL_OPTION)
 
         if result == JOptionPane.OK_OPTION:
             self.config["sheet_id"] = txt_id.getText().strip()
             self.config["sheet_name"] = txt_sheet_name.getText().strip()
             self.config["project_id"] = txt_project.getText().strip()
             self.config["access_token"] = txt_token.getText().strip()
+            self.config["auth_method"] = "gcloud"
+            self.config["email"] = txt_query_email.getText().strip()
+            
+            # 清除 OAuth 2.0 相關的 token（如果存在）
+            if self.config.get("auth_method") == "gcloud":
+                # 保留 refresh_token 和 token_expires_at，但標記為 gcloud 方式
+                pass
             
             # 保存配置到文件
             self._save_config_to_file()
             
             return True
         return False
-
-    def _get_config_file_path(self):
-        """獲取配置文件路徑"""
-        home = os.path.expanduser("~")
-        return os.path.join(home, ".burp_google_config.json")
     
-    def _get_token_file_path(self):
-        """獲取 token 文件路徑"""
+    def show_oauth2_config_dialog(self, event=None):
+        """OAuth 2.0 Configuration 對話框"""
+        panel = JPanel()
+        panel.setLayout(BoxLayout(panel, BoxLayout.Y_AXIS))
+        
+        txt_id = JTextField(self.config["sheet_id"], 40)
+        txt_sheet_name = JTextField(safe_unicode_convert(self.config["sheet_name"]), 40)
+        # OAuth 2.0 不需要 project_id，不顯示此欄位
+        txt_token = JTextArea(safe_unicode_convert(self.config["access_token"]))
+        txt_token.setLineWrap(True)
+        scroll_token = JScrollPane(txt_token)
+        scroll_token.setPreferredSize(Dimension(400, 100))
+        
+        # OAuth 2.0 配置欄位
+        txt_oauth2_client_id = JTextField(self.config.get("oauth2_client_id", ""), 40)
+        txt_oauth2_client_secret = JTextField(self.config.get("oauth2_client_secret", ""), 40)
+        
+        # 顯示當前 token 的 email（優先使用配置中的 email）
+        token_email_label = JLabel(u"")
+        current_email = self.config.get("email", "")
+        if self.config.get("access_token") and self.config.get("auth_method", "gcloud") == "oauth2":
+            # 優先使用配置中已保存的 email
+            if current_email:
+                token_email_label.setText(u"當前 Token Email: " + current_email)
+            else:
+                # 如果配置中沒有 email，則從 token 獲取
+                token_info = self._get_token_info(self.config["access_token"])
+                if token_info and token_info.get("email"):
+                    email = token_info["email"]
+                    self.config["email"] = email
+                    self._save_config_to_file()
+                    current_email = email
+                    token_email_label.setText(u"當前 Token Email: " + email)
+                else:
+                    token_email_label.setText(u"當前 Token Email: 無法獲取")
+        else:
+            token_email_label.setText(u"當前 Token Email: 未設置")
+        
+        # 查詢 Spreadsheet 列表相關組件
+        txt_query_email = JTextField(current_email, 40)
+        btn_get_token_oauth2 = JButton(u"OAuth 2.0 授權", actionPerformed=self._create_oauth2_authorizer(txt_token, txt_oauth2_client_id, txt_oauth2_client_secret, txt_query_email))
+        combo_sheets = JComboBox([u"請先查詢 Spreadsheet 列表"])
+        combo_sheets.setEnabled(False)
+        
+        # 將 combo_sheets 存儲在 panel 的 client property 中，以便在查詢處理器中訪問
+        panel.putClientProperty("combo_sheets", combo_sheets)
+        panel.putClientProperty("txt_id", txt_id)
+        panel.putClientProperty("txt_sheet_name", txt_sheet_name)
+        
+        btn_query_sheets = JButton(u"查詢 Spreadsheet 列表", actionPerformed=self._create_sheet_query_handler(txt_query_email, panel))
+        
+        # 當選擇下拉式選單項目時，只自動填充 sheet_id（不覆蓋 Target Sheet Name）
+        def on_combo_change(event):
+            selected_item = combo_sheets.getSelectedItem()
+            if selected_item and selected_item != u"請先查詢 Spreadsheet 列表":
+                # selected_item 格式: "display_text|sheetid|project"
+                if "|" in selected_item:
+                    parts = selected_item.split("|")
+                    if len(parts) >= 2:
+                        # parts[0] 是顯示文本，parts[1] 是 sheetid
+                        sheetid = parts[1]
+                        txt_id.setText(sheetid)
+                        # 不覆蓋 Target Sheet Name，保持預設值"弱點清單"
+        
+        combo_sheets.addActionListener(on_combo_change)
+        
+        panel.add(JLabel(u"認證方式: OAuth 2.0"))
+        panel.add(Box.createVerticalStrut(5))
+        panel.add(JLabel(u"OAuth 2.0 Client ID:"))
+        panel.add(txt_oauth2_client_id)
+        panel.add(Box.createVerticalStrut(5))
+        panel.add(JLabel(u"OAuth 2.0 Client Secret:"))
+        panel.add(txt_oauth2_client_secret)
+        panel.add(Box.createVerticalStrut(5))
+        panel.add(btn_get_token_oauth2)
+        panel.add(Box.createVerticalStrut(5))
+        panel.add(JLabel(u"查詢 Email:"))
+        panel.add(txt_query_email)
+        panel.add(Box.createVerticalStrut(5))
+        panel.add(btn_query_sheets)
+        panel.add(Box.createVerticalStrut(5))
+        panel.add(JLabel(u"可選 Spreadsheet:"))
+        panel.add(combo_sheets)
+        panel.add(Box.createVerticalStrut(5))
+        panel.add(JLabel(u"Spreadsheet ID:"))
+        panel.add(txt_id)
+        panel.add(Box.createVerticalStrut(5))
+        panel.add(JLabel(u"Target Sheet Name:"))
+        panel.add(txt_sheet_name)
+        panel.add(Box.createVerticalStrut(5))
+        panel.add(JLabel(u"OAuth Token:"))
+        panel.add(scroll_token)
+        panel.add(Box.createVerticalStrut(5))
+        panel.add(token_email_label)
+
+        result = JOptionPane.showConfirmDialog(None, panel, u"OAuth 2.0 Configuration", JOptionPane.OK_CANCEL_OPTION)
+
+        if result == JOptionPane.OK_OPTION:
+            self.config["sheet_id"] = txt_id.getText().strip()
+            self.config["sheet_name"] = txt_sheet_name.getText().strip()
+            # OAuth 2.0 不需要 project_id，不保存
+            self.config["access_token"] = txt_token.getText().strip()
+            self.config["auth_method"] = "oauth2"
+            self.config["oauth2_client_id"] = txt_oauth2_client_id.getText().strip()
+            self.config["oauth2_client_secret"] = txt_oauth2_client_secret.getText().strip()
+            self.config["email"] = txt_query_email.getText().strip()
+            
+            # 保存配置到文件（使用 OAuth 2.0 專用文件名）
+            self._save_config_to_file()
+            
+            return True
+        return False
+    
+    def _show_auth_method_selection_dialog(self):
+        """顯示認證方式選擇對話框，返回選擇的認證方式（"gcloud" 或 "oauth2"），如果取消則返回 None"""
+        panel = JPanel()
+        panel.setLayout(BoxLayout(panel, BoxLayout.Y_AXIS))
+        
+        # 添加說明文字
+        panel.add(JLabel(u"請先選擇認證方式："))
+        panel.add(Box.createVerticalStrut(10))
+        
+        # 創建單選按鈕組
+        auth_method_group = ButtonGroup()
+        auth_method_gcloud = JRadioButton(u"Google CLI (gcloud)", True)
+        auth_method_oauth2 = JRadioButton(u"OAuth 2.0", False)
+        auth_method_group.add(auth_method_gcloud)
+        auth_method_group.add(auth_method_oauth2)
+        
+        # 添加單選按鈕到面板
+        panel.add(auth_method_gcloud)
+        panel.add(Box.createVerticalStrut(5))
+        panel.add(auth_method_oauth2)
+        panel.add(Box.createVerticalStrut(10))
+        
+        # 添加說明文字
+        panel.add(JLabel(u"Google CLI: 需要安裝並配置 gcloud CLI"))
+        panel.add(Box.createVerticalStrut(5))
+        panel.add(JLabel(u"OAuth 2.0: 無需安裝 gcloud CLI，使用瀏覽器授權"))
+        
+        result = JOptionPane.showConfirmDialog(None, panel, u"選擇認證方式", JOptionPane.OK_CANCEL_OPTION)
+        
+        if result == JOptionPane.OK_OPTION:
+            if auth_method_oauth2.isSelected():
+                return "oauth2"
+            else:
+                return "gcloud"
+        else:
+            return None
+
+    def _get_config_file_path(self, auth_method=None):
+        """獲取配置文件路徑，根據認證方式使用不同的文件名"""
         home = os.path.expanduser("~")
-        return os.path.join(home, ".burp_google_token.json")
+        if auth_method is None:
+            auth_method = self.config.get("auth_method", "gcloud")
+        
+        if auth_method == "oauth2":
+            return os.path.join(home, ".burp_google_config_oauth2.json")
+        else:
+            return os.path.join(home, ".burp_google_config_gcloud.json")
+    
+    def _get_token_file_path(self, auth_method=None):
+        """獲取 token 文件路徑，根據認證方式使用不同的文件名"""
+        home = os.path.expanduser("~")
+        if auth_method is None:
+            auth_method = self.config.get("auth_method", "gcloud")
+        
+        if auth_method == "oauth2":
+            return os.path.join(home, ".burp_google_token_oauth2.json")
+        else:
+            return os.path.join(home, ".burp_google_token_gcloud.json")
     
     def _save_config_to_file(self):
-        """保存配置到本地文件"""
+        """保存配置到本地文件，根據當前認證方式使用對應的文件名"""
         try:
-            config_file = self._get_config_file_path()
+            auth_method = self.config.get("auth_method", "gcloud")
+            config_file = self._get_config_file_path(auth_method)
             # 只保存非敏感配置（不包含 access_token）
             # 確保所有值都是 unicode 字符串
             config_to_save = {
                 "sheet_id": safe_unicode_convert(self.config.get("sheet_id", "")),
-                "project_id": safe_unicode_convert(self.config.get("project_id", "")),
                 "sheet_name": safe_unicode_convert(self.config.get("sheet_name", "")),
                 "email": safe_unicode_convert(self.config.get("email", "")),
+                "auth_method": safe_unicode_convert(self.config.get("auth_method", "gcloud")),
+                "oauth2_client_id": safe_unicode_convert(self.config.get("oauth2_client_id", "")),
                 "saved_at": time.time()
             }
+            # 只有使用 gcloud CLI 認證時才保存 project_id
+            # OAuth 2.0 認證不需要 project_id
+            if auth_method == "gcloud":
+                config_to_save["project_id"] = safe_unicode_convert(self.config.get("project_id", ""))
             
             # 確保所有字符串值都是 unicode（json.dump 需要）
             for key, value in config_to_save.items():
@@ -226,9 +414,26 @@ class BurpExtender(IBurpExtender, IContextMenuFactory):
             print((u"DEBUG: " + error_msg).encode('utf-8'))
     
     def _load_config_from_file(self):
-        """從本地文件載入配置"""
+        """從本地文件載入配置，根據當前認證方式載入對應的配置文件"""
         try:
-            config_file = self._get_config_file_path()
+            # 先嘗試載入當前認證方式的配置
+            auth_method = self.config.get("auth_method", "gcloud")
+            config_file = self._get_config_file_path(auth_method)
+            
+            # 如果當前認證方式的配置文件不存在，嘗試載入另一個
+            if not os.path.exists(config_file):
+                # 嘗試載入另一個認證方式的配置（用於兼容舊版本）
+                other_auth_method = "oauth2" if auth_method == "gcloud" else "gcloud"
+                other_config_file = self._get_config_file_path(other_auth_method)
+                if os.path.exists(other_config_file):
+                    # 如果找到另一個認證方式的配置，詢問用戶是否要切換
+                    config_file = other_config_file
+                    # 從文件名推斷認證方式
+                    if "oauth2" in config_file:
+                        self.config["auth_method"] = "oauth2"
+                    else:
+                        self.config["auth_method"] = "gcloud"
+            
             if os.path.exists(config_file):
                 with codecs.open(config_file, 'r', encoding='utf-8') as f:
                     config_data = json.load(f)
@@ -241,16 +446,23 @@ class BurpExtender(IBurpExtender, IContextMenuFactory):
                         self.config["sheet_name"] = safe_unicode_convert(config_data.get("sheet_name", ""))
                     if "email" in config_data:
                         self.config["email"] = safe_unicode_convert(config_data.get("email", ""))
+                    if "auth_method" in config_data:
+                        self.config["auth_method"] = safe_unicode_convert(config_data.get("auth_method", "gcloud"))
+                    if "oauth2_client_id" in config_data:
+                        self.config["oauth2_client_id"] = safe_unicode_convert(config_data.get("oauth2_client_id", ""))
                     print("DEBUG: Configuration loaded from file")
         except Exception as e:
             print("DEBUG: Failed to load configuration: " + str(e))
     
     def _save_token_to_file(self, token):
-        """保存 token 到本地文件"""
+        """保存 token 到本地文件，根據當前認證方式使用對應的文件名"""
         try:
-            token_file = self._get_token_file_path()
+            auth_method = self.config.get("auth_method", "gcloud")
+            token_file = self._get_token_file_path(auth_method)
             token_data = {
                 "access_token": safe_unicode_convert(token),
+                "refresh_token": safe_unicode_convert(self.config.get("refresh_token", "")),
+                "token_expires_at": self.config.get("token_expires_at", 0),
                 "saved_at": time.time()
             }
             with codecs.open(token_file, 'w', encoding='utf-8') as f:
@@ -261,16 +473,41 @@ class BurpExtender(IBurpExtender, IContextMenuFactory):
             print(("DEBUG: " + error_msg).encode('utf-8'))
     
     def _load_token_from_file(self):
-        """從本地文件載入 token"""
+        """從本地文件載入 token，根據當前認證方式載入對應的 token 文件"""
         try:
-            token_file = self._get_token_file_path()
+            # 先嘗試載入當前認證方式的 token
+            auth_method = self.config.get("auth_method", "gcloud")
+            token_file = self._get_token_file_path(auth_method)
+            
+            # 如果當前認證方式的 token 文件不存在，嘗試載入另一個
+            if not os.path.exists(token_file):
+                # 嘗試載入另一個認證方式的 token（用於兼容舊版本）
+                other_auth_method = "oauth2" if auth_method == "gcloud" else "gcloud"
+                other_token_file = self._get_token_file_path(other_auth_method)
+                if os.path.exists(other_token_file):
+                    token_file = other_token_file
+                    # 從文件名推斷認證方式
+                    if "oauth2" in token_file:
+                        self.config["auth_method"] = "oauth2"
+                    else:
+                        self.config["auth_method"] = "gcloud"
+            
             if os.path.exists(token_file):
                 with codecs.open(token_file, 'r', encoding='utf-8') as f:
                     token_data = json.load(f)
                     token = token_data.get("access_token", "")
+                    refresh_token = token_data.get("refresh_token", "")
+                    token_expires_at = token_data.get("token_expires_at", 0)
+                    
                     if token:
                         # 確保 token 是字符串類型
                         token = safe_unicode_convert(token)
+                        # 載入 refresh_token 和 expires_at
+                        if refresh_token:
+                            self.config["refresh_token"] = safe_unicode_convert(refresh_token)
+                        if token_expires_at:
+                            self.config["token_expires_at"] = token_expires_at
+                        
                         # 檢查 token 是否有效
                         if self._check_token_valid(token):
                             self.config["access_token"] = token
@@ -313,14 +550,18 @@ class BurpExtender(IBurpExtender, IContextMenuFactory):
             # 檢查是否有 email 字段
             email = result.get("email", "")
             if not email:
-                # 嘗試使用 gcloud 命令獲取當前用戶信息
-                print("DEBUG: No email in token info, attempting to get from gcloud command...".encode('utf-8'))
-                gcloud_email = self._get_gcloud_email()
-                if gcloud_email:
-                    email = gcloud_email
-                    email_unicode = safe_unicode_convert(email)
-                    debug_email = u"DEBUG: Got email from gcloud: " + email_unicode
-                    print(debug_email.encode('utf-8'))
+                # 只有在使用 gcloud 認證時才嘗試使用 gcloud 命令獲取 email
+                auth_method = self.config.get("auth_method", "gcloud")
+                if auth_method == "gcloud":
+                    print("DEBUG: No email in token info, attempting to get from gcloud command...".encode('utf-8'))
+                    gcloud_email = self._get_gcloud_email()
+                    if gcloud_email:
+                        email = gcloud_email
+                        email_unicode = safe_unicode_convert(email)
+                        debug_email = u"DEBUG: Got email from gcloud: " + email_unicode
+                        print(debug_email.encode('utf-8'))
+                else:
+                    print("DEBUG: No email in token info (OAuth 2.0 mode, skipping gcloud fallback)".encode('utf-8'))
             
             token_info = {
                 "email": safe_unicode_convert(email),
@@ -339,11 +580,15 @@ class BurpExtender(IBurpExtender, IContextMenuFactory):
             debug_http = u"DEBUG: HTTP error " + safe_unicode_convert(str(e.code)) + u": " + error_body[:200]
             print(debug_http.encode('utf-8'))
             if e.code == 400:
-                # 嘗試使用 gcloud 命令獲取 email
-                print("DEBUG: Token info API returned 400, attempting to get email from gcloud command...".encode('utf-8'))
-                gcloud_email = self._get_gcloud_email()
-                if gcloud_email:
-                    return {"email": gcloud_email, "user_id": "", "expires_in": 0, "scope": "", "audience": ""}
+                # 只有在使用 gcloud 認證時才嘗試使用 gcloud 命令獲取 email
+                auth_method = self.config.get("auth_method", "gcloud")
+                if auth_method == "gcloud":
+                    print("DEBUG: Token info API returned 400, attempting to get email from gcloud command...".encode('utf-8'))
+                    gcloud_email = self._get_gcloud_email()
+                    if gcloud_email:
+                        return {"email": gcloud_email, "user_id": "", "expires_in": 0, "scope": "", "audience": ""}
+                else:
+                    print("DEBUG: Token info API returned 400 (OAuth 2.0 mode, skipping gcloud fallback)".encode('utf-8'))
             return None
         except Exception as e:
             try:
@@ -359,10 +604,39 @@ class BurpExtender(IBurpExtender, IContextMenuFactory):
                 print(debug_trace.encode('utf-8'))
             except:
                 print("DEBUG: Unable to display detailed stack trace".encode('utf-8'))
-            # 嘗試使用 gcloud 命令獲取 email
-            gcloud_email = self._get_gcloud_email()
-            if gcloud_email:
-                return {"email": gcloud_email, "user_id": "", "expires_in": 0, "scope": "", "audience": ""}
+            # 只有在使用 gcloud 認證時才嘗試使用 gcloud 命令獲取 email
+            auth_method = self.config.get("auth_method", "gcloud")
+            if auth_method == "gcloud":
+                gcloud_email = self._get_gcloud_email()
+                if gcloud_email:
+                    return {"email": gcloud_email, "user_id": "", "expires_in": 0, "scope": "", "audience": ""}
+            else:
+                print("DEBUG: Exception in token info (OAuth 2.0 mode, skipping gcloud fallback)".encode('utf-8'))
+            return None
+    
+    def _get_email_from_userinfo_api(self, access_token):
+        """使用 Google UserInfo API 獲取 email（作為 tokeninfo API 的備用方案）"""
+        try:
+            url = "https://www.googleapis.com/oauth2/v2/userinfo"
+            print("DEBUG: Attempting to get email from UserInfo API...".encode('utf-8'))
+            req = urllib2.Request(url)
+            req.add_header("Authorization", "Bearer " + safe_unicode_convert(access_token))
+            response = urllib2.urlopen(req)
+            response_body = response.read()
+            response_body_str = safe_unicode_convert(response_body)
+            print(("DEBUG: UserInfo API response: " + response_body_str[:200]).encode('utf-8'))
+            result = json.loads(response_body_str)
+            email = result.get("email", "")
+            if email:
+                debug_email = u"DEBUG: Got email from UserInfo API: " + safe_unicode_convert(email)
+                print(debug_email.encode('utf-8'))
+                return email
+            else:
+                print("DEBUG: UserInfo API did not return email".encode('utf-8'))
+                return None
+        except Exception as e:
+            error_msg = safe_unicode_convert(str(e))
+            print(("DEBUG: UserInfo API error: " + error_msg).encode('utf-8'))
             return None
     
     def _get_gcloud_email(self):
@@ -478,23 +752,34 @@ class BurpExtender(IBurpExtender, IContextMenuFactory):
             if not current_token:
                 debug_msg = u"DEBUG: [Token Refresh] Token does not exist, attempting to get new token..."
                 print(debug_msg.encode('utf-8'))
-                token, error = self._get_gcloud_token()
-                if token:
-                    # 驗證新獲取的 token 是否有效
-                    if self._check_token_valid(token):
-                        self.config["access_token"] = token
-                        self._save_token_to_file(token)
-                        debug_success = u"DEBUG: [Token Refresh] Successfully obtained and validated new token"
-                        print(debug_success.encode('utf-8'))
-                        return True
-                    else:
-                        error_msg = u"DEBUG: [Token Refresh] Newly obtained token is invalid"
-                        print(error_msg.encode('utf-8'))
-                        return False
-                else:
-                    error_msg = u"DEBUG: [Token Refresh] Unable to get token: " + safe_unicode_convert(error or u"Unknown error")
+                
+                # 根據認證方式選擇正確的獲取方法
+                auth_method = self.config.get("auth_method", "gcloud")
+                
+                if auth_method == "oauth2":
+                    # OAuth 2.0 需要手動授權，無法自動獲取
+                    error_msg = u"DEBUG: [Token Refresh] OAuth 2.0 token does not exist. Please authorize manually in Configuration."
                     print(error_msg.encode('utf-8'))
                     return False
+                else:
+                    # 使用 gcloud 獲取 token
+                    token, error = self._get_gcloud_token()
+                    if token:
+                        # 驗證新獲取的 token 是否有效
+                        if self._check_token_valid(token):
+                            self.config["access_token"] = token
+                            self._save_token_to_file(token)
+                            debug_success = u"DEBUG: [Token Refresh] Successfully obtained and validated new token"
+                            print(debug_success.encode('utf-8'))
+                            return True
+                        else:
+                            error_msg = u"DEBUG: [Token Refresh] Newly obtained token is invalid"
+                            print(error_msg.encode('utf-8'))
+                            return False
+                    else:
+                        error_msg = u"DEBUG: [Token Refresh] Unable to get token: " + safe_unicode_convert(error or u"Unknown error")
+                        print(error_msg.encode('utf-8'))
+                        return False
             
             # 檢查 token 是否有效
             debug_check = u"DEBUG: [Token Refresh] Checking current token validity..."
@@ -505,31 +790,72 @@ class BurpExtender(IBurpExtender, IContextMenuFactory):
             
             if is_valid:
                 # 檢查 token 是否即將過期（提前 5 分鐘刷新）
-                token_info = self._get_token_info(current_token)
-                if token_info and token_info.get("expires_in", 0) > 0:
-                    expires_in = token_info.get("expires_in", 0)
-                    debug_expires = u"DEBUG: [Token Refresh] Token remaining time: " + str(expires_in) + u" seconds"
-                    print(debug_expires.encode('utf-8'))
-                    if expires_in < 300:  # 少於 5 分鐘，提前刷新
-                        debug_msg = u"DEBUG: [Token Refresh] Token expiring soon (remaining " + str(expires_in) + u" seconds), auto-refreshing..."
-                        print(debug_msg.encode('utf-8'))
-                        token, error = self._get_gcloud_token()
-                        if token:
-                            # 驗證新獲取的 token 是否有效
-                            if self._check_token_valid(token):
-                                self.config["access_token"] = token
-                                self._save_token_to_file(token)
-                                debug_success = u"DEBUG: [Token Refresh] Successfully refreshed and validated new token"
-                                print(debug_success.encode('utf-8'))
-                                return True
+                auth_method = self.config.get("auth_method", "gcloud")
+                
+                # 對於 OAuth 2.0，檢查 token_expires_at
+                if auth_method == "oauth2":
+                    token_expires_at = self.config.get("token_expires_at", 0)
+                    if token_expires_at > 0:
+                        current_time = int(time.time())
+                        remaining_time = token_expires_at - current_time
+                        debug_expires = u"DEBUG: [Token Refresh] Token remaining time: " + str(remaining_time) + u" seconds"
+                        print(debug_expires.encode('utf-8'))
+                        
+                        if remaining_time < 300:  # 少於 5 分鐘，提前刷新
+                            debug_msg = u"DEBUG: [Token Refresh] OAuth 2.0 token expiring soon, auto-refreshing..."
+                            print(debug_msg.encode('utf-8'))
+                            
+                            refresh_token = self.config.get("refresh_token", "")
+                            client_id = self.config.get("oauth2_client_id", "")
+                            client_secret = self.config.get("oauth2_client_secret", "")
+                            
+                            if refresh_token and client_id and client_secret:
+                                token, expires_in, error = self._oauth2_refresh_token(refresh_token, client_id, client_secret)
+                                if token:
+                                    if self._check_token_valid(token):
+                                        debug_success = u"DEBUG: [Token Refresh] Successfully refreshed OAuth 2.0 token"
+                                        print(debug_success.encode('utf-8'))
+                                        return True
+                                    else:
+                                        error_msg = u"DEBUG: [Token Refresh] Newly refreshed OAuth 2.0 token is invalid"
+                                        print(error_msg.encode('utf-8'))
+                                        return False
+                                else:
+                                    error_msg = u"DEBUG: [Token Refresh] Unable to refresh OAuth 2.0 token: " + safe_unicode_convert(error or u"Unknown error")
+                                    print(error_msg.encode('utf-8'))
+                                    return False
                             else:
-                                error_msg = u"DEBUG: [Token Refresh] Newly refreshed token is invalid"
+                                error_msg = u"DEBUG: [Token Refresh] Missing OAuth 2.0 refresh token or credentials"
                                 print(error_msg.encode('utf-8'))
                                 return False
-                        else:
-                            error_msg = u"DEBUG: [Token Refresh] Unable to get new token: " + safe_unicode_convert(error or u"Unknown error")
-                            print(error_msg.encode('utf-8'))
-                            return False
+                else:
+                    # 對於 gcloud，使用原有的邏輯
+                    token_info = self._get_token_info(current_token)
+                    if token_info and token_info.get("expires_in", 0) > 0:
+                        expires_in = token_info.get("expires_in", 0)
+                        debug_expires = u"DEBUG: [Token Refresh] Token remaining time: " + str(expires_in) + u" seconds"
+                        print(debug_expires.encode('utf-8'))
+                        if expires_in < 300:  # 少於 5 分鐘，提前刷新
+                            debug_msg = u"DEBUG: [Token Refresh] Token expiring soon (remaining " + str(expires_in) + u" seconds), auto-refreshing..."
+                            print(debug_msg.encode('utf-8'))
+                            token, error = self._get_gcloud_token()
+                            if token:
+                                # 驗證新獲取的 token 是否有效
+                                if self._check_token_valid(token):
+                                    self.config["access_token"] = token
+                                    self._save_token_to_file(token)
+                                    debug_success = u"DEBUG: [Token Refresh] Successfully refreshed and validated new token"
+                                    print(debug_success.encode('utf-8'))
+                                    return True
+                                else:
+                                    error_msg = u"DEBUG: [Token Refresh] Newly refreshed token is invalid"
+                                    print(error_msg.encode('utf-8'))
+                                    return False
+                            else:
+                                error_msg = u"DEBUG: [Token Refresh] Unable to get new token: " + safe_unicode_convert(error or u"Unknown error")
+                                print(error_msg.encode('utf-8'))
+                                return False
+                
                 debug_ok = u"DEBUG: [Token Refresh] Token is valid and not expired, no refresh needed"
                 print(debug_ok.encode('utf-8'))
                 return True
@@ -537,23 +863,53 @@ class BurpExtender(IBurpExtender, IContextMenuFactory):
                 # Token 無效，嘗試刷新
                 debug_msg = u"DEBUG: [Token Refresh] Token is invalid, attempting to refresh..."
                 print(debug_msg.encode('utf-8'))
-                token, error = self._get_gcloud_token()
-                if token:
-                    # 驗證新獲取的 token 是否有效
-                    if self._check_token_valid(token):
-                        self.config["access_token"] = token
-                        self._save_token_to_file(token)
-                        debug_success = u"DEBUG: [Token Refresh] Successfully refreshed and validated new token"
-                        print(debug_success.encode('utf-8'))
-                        return True
+                
+                auth_method = self.config.get("auth_method", "gcloud")
+                
+                if auth_method == "oauth2":
+                    # 使用 OAuth 2.0 refresh token
+                    refresh_token = self.config.get("refresh_token", "")
+                    client_id = self.config.get("oauth2_client_id", "")
+                    client_secret = self.config.get("oauth2_client_secret", "")
+                    
+                    if refresh_token and client_id and client_secret:
+                        token, expires_in, error = self._oauth2_refresh_token(refresh_token, client_id, client_secret)
+                        if token:
+                            if self._check_token_valid(token):
+                                debug_success = u"DEBUG: [Token Refresh] Successfully refreshed OAuth 2.0 token"
+                                print(debug_success.encode('utf-8'))
+                                return True
+                            else:
+                                error_msg = u"DEBUG: [Token Refresh] Newly refreshed OAuth 2.0 token is invalid, failed validation"
+                                print(error_msg.encode('utf-8'))
+                                return False
+                        else:
+                            error_msg = u"DEBUG: [Token Refresh] Unable to refresh OAuth 2.0 token: " + safe_unicode_convert(error or u"Unknown error")
+                            print(error_msg.encode('utf-8'))
+                            return False
                     else:
-                        error_msg = u"DEBUG: [Token Refresh] Newly refreshed token is invalid, failed validation"
+                        error_msg = u"DEBUG: [Token Refresh] Missing OAuth 2.0 refresh token or credentials"
                         print(error_msg.encode('utf-8'))
                         return False
                 else:
-                    error_msg = u"DEBUG: [Token Refresh] Unable to refresh token: " + safe_unicode_convert(error or u"Unknown error")
-                    print(error_msg.encode('utf-8'))
-                    return False
+                    # 使用 gcloud
+                    token, error = self._get_gcloud_token()
+                    if token:
+                        # 驗證新獲取的 token 是否有效
+                        if self._check_token_valid(token):
+                            self.config["access_token"] = token
+                            self._save_token_to_file(token)
+                            debug_success = u"DEBUG: [Token Refresh] Successfully refreshed and validated new token"
+                            print(debug_success.encode('utf-8'))
+                            return True
+                        else:
+                            error_msg = u"DEBUG: [Token Refresh] Newly refreshed token is invalid, failed validation"
+                            print(error_msg.encode('utf-8'))
+                            return False
+                    else:
+                        error_msg = u"DEBUG: [Token Refresh] Unable to refresh token: " + safe_unicode_convert(error or u"Unknown error")
+                        print(error_msg.encode('utf-8'))
+                        return False
         except Exception as e:
             error_msg = u"DEBUG: [Token Refresh] Exception occurred while ensuring token validity: " + safe_unicode_convert(str(e))
             print(error_msg.encode('utf-8'))
@@ -570,9 +926,9 @@ class BurpExtender(IBurpExtender, IContextMenuFactory):
         """從 gcloud CLI 獲取 access token"""
         print("DEBUG: ========== Starting to get gcloud token ==========")
         
-        # 先檢查本地是否有有效的 token
+        # 先檢查本地是否有有效的 token（使用 gcloud 認證方式的 token 文件）
         try:
-            token_file = self._get_token_file_path()
+            token_file = self._get_token_file_path("gcloud")
             if os.path.exists(token_file):
                 with open(token_file, 'r') as f:
                     token_data = json.load(f)
@@ -964,6 +1320,381 @@ class BurpExtender(IBurpExtender, IContextMenuFactory):
             thread.start()
         
         return fetch_token
+    
+    def _create_oauth2_authorizer(self, txt_token, txt_client_id, txt_client_secret, txt_query_email):
+        """創建 OAuth 2.0 授權按鈕的事件處理器"""
+        def authorize_oauth2(event):
+            client_id = txt_client_id.getText().strip()
+            client_secret = txt_client_secret.getText().strip()
+            
+            if not client_id or not client_secret:
+                JOptionPane.showMessageDialog(None, u"請輸入 OAuth 2.0 Client ID 和 Client Secret", u"錯誤", JOptionPane.ERROR_MESSAGE)
+                return
+            
+            print("DEBUG: Starting OAuth 2.0 authorization flow...".encode('utf-8'))
+            
+            def authorize_in_thread():
+                try:
+                    # 執行 OAuth 2.0 授權流程
+                    access_token, refresh_token, email, error = self._oauth2_authorize(client_id, client_secret)
+                    
+                    if access_token:
+                        # 在 Swing 事件線程中更新 UI
+                        from javax.swing import SwingUtilities
+                        def update_ui():
+                            txt_token.setText(access_token)
+                            if email:
+                                txt_query_email.setText(email)
+                            success_msg = u"OAuth 2.0 授權成功！\n\nToken Email: " + email if email else u"OAuth 2.0 授權成功！"
+                            JOptionPane.showMessageDialog(None, success_msg, u"成功", JOptionPane.INFORMATION_MESSAGE)
+                        SwingUtilities.invokeLater(update_ui)
+                    else:
+                        error_msg = error or u"未知錯誤"
+                        from javax.swing import SwingUtilities
+                        def show_error():
+                            JOptionPane.showMessageDialog(None, u"OAuth 2.0 授權失敗:\n" + safe_unicode_convert(error_msg), u"錯誤", JOptionPane.ERROR_MESSAGE)
+                        SwingUtilities.invokeLater(show_error)
+                except Exception as e:
+                    print("DEBUG: OAuth 2.0 authorization exception: " + str(e))
+                    import traceback
+                    print("DEBUG: Detailed stack trace: " + traceback.format_exc())
+                    from javax.swing import SwingUtilities
+                    def show_error():
+                        JOptionPane.showMessageDialog(None, u"OAuth 2.0 授權時發生異常:\n" + safe_unicode_convert(str(e)), u"錯誤", JOptionPane.ERROR_MESSAGE)
+                    SwingUtilities.invokeLater(show_error)
+            
+            # 啟動背景線程
+            thread = threading.Thread(target=authorize_in_thread)
+            thread.daemon = True
+            thread.start()
+        
+        return authorize_oauth2
+    
+    def _oauth2_authorize(self, client_id, client_secret):
+        """執行 OAuth 2.0 授權流程"""
+        try:
+            # 臨時設置 auth_method 為 oauth2，確保 _get_token_info() 使用正確的邏輯
+            original_auth_method = self.config.get("auth_method", "gcloud")
+            self.config["auth_method"] = "oauth2"
+            
+            # 生成 state 和 code_verifier (PKCE)
+            state = ''.join(random.choice(string.ascii_letters + string.digits) for _ in range(32))
+            code_verifier = base64.urlsafe_b64encode(''.join(random.choice(string.ascii_letters + string.digits) for _ in range(32)).encode('utf-8')).decode('utf-8').rstrip('=')
+            
+            # 生成 code_challenge (SHA256 hash of code_verifier)
+            import hashlib
+            code_challenge = base64.urlsafe_b64encode(hashlib.sha256(code_verifier.encode('utf-8')).digest()).decode('utf-8').rstrip('=')
+            
+            # 啟動本地回調伺服器
+            callback_port = self._start_callback_server(state)
+            if not callback_port:
+                return (None, None, None, u"無法啟動本地回調伺服器")
+            
+            redirect_uri = "http://localhost:" + str(callback_port) + "/callback"
+            
+            # 構建授權 URL
+            # 添加 userinfo.email scope 以獲取用戶 email
+            scope = "https://www.googleapis.com/auth/spreadsheets https://www.googleapis.com/auth/drive.readonly https://www.googleapis.com/auth/userinfo.email"
+            auth_url = (
+                "https://accounts.google.com/o/oauth2/v2/auth?"
+                "client_id=" + urllib.quote(client_id.encode('utf-8')) +
+                "&redirect_uri=" + urllib.quote(redirect_uri.encode('utf-8')) +
+                "&response_type=code" +
+                "&scope=" + urllib.quote(scope.encode('utf-8')) +
+                "&access_type=offline" +
+                "&prompt=consent" +
+                "&state=" + urllib.quote(state.encode('utf-8')) +
+                "&code_challenge=" + urllib.quote(code_challenge.encode('utf-8')) +
+                "&code_challenge_method=S256"
+            )
+            
+            print(("DEBUG: Authorization URL: " + auth_url).encode('utf-8'))
+            
+            # 打開瀏覽器
+            try:
+                import webbrowser
+                webbrowser.open(auth_url)
+            except:
+                # 備用方法：使用 Java Desktop API
+                try:
+                    from java.awt import Desktop
+                    if Desktop.isDesktopSupported():
+                        desktop = Desktop.getDesktop()
+                        if desktop.isSupported(Desktop.Action.BROWSE):
+                            desktop.browse(URI(auth_url))
+                except:
+                    pass
+            
+            # 等待授權碼
+            authorization_code = self._wait_for_authorization_code(callback_port, state)
+            
+            if not authorization_code:
+                return (None, None, None, u"未收到授權碼或授權被取消")
+            
+            # 使用授權碼交換 token
+            access_token, refresh_token, expires_in, email = self._oauth2_exchange_code(
+                authorization_code, client_id, client_secret, redirect_uri, code_verifier
+            )
+            
+            if access_token:
+                # 保存 tokens
+                self.config["access_token"] = access_token
+                self.config["refresh_token"] = refresh_token
+                self.config["email"] = email or ""
+                self.config["token_expires_at"] = int(time.time()) + expires_in if expires_in else 0
+                self._save_token_to_file(access_token)
+                self._save_config_to_file()
+                
+                return (access_token, refresh_token, email, None)
+            else:
+                return (None, None, None, u"無法交換授權碼獲取 token")
+                
+        except Exception as e:
+            error_msg = safe_unicode_convert(str(e))
+            print(("DEBUG: OAuth 2.0 authorization error: " + error_msg).encode('utf-8'))
+            import traceback
+            print(("DEBUG: Detailed stack trace: " + traceback.format_exc()).encode('utf-8'))
+            return (None, None, None, error_msg)
+        finally:
+            # 恢復原始的 auth_method（如果之前有保存）
+            if 'original_auth_method' in locals():
+                self.config["auth_method"] = original_auth_method
+    
+    def _start_callback_server(self, expected_state):
+        """啟動本地回調伺服器"""
+        try:
+            # 嘗試綁定到可用端口（從 8769 開始）
+            server_socket = None
+            port = 8769
+            max_attempts = 10
+            
+            for attempt in range(max_attempts):
+                try:
+                    server_socket = ServerSocket(port)
+                    print(("DEBUG: Started callback server on port " + str(port)).encode('utf-8'))
+                    break
+                except:
+                    port += 1
+                    if attempt == max_attempts - 1:
+                        return None
+            
+            if not server_socket:
+                return None
+            
+            # 在背景線程中處理連接
+            def handle_server():
+                client_socket = None
+                try:
+                    # 設置超時（120秒）
+                    server_socket.setSoTimeout(120000)
+                    client_socket = server_socket.accept()
+                    
+                    # 讀取請求
+                    input_stream = client_socket.getInputStream()
+                    reader = BufferedReader(InputStreamReader(input_stream, "UTF-8"))
+                    
+                    request_line = reader.readLine()
+                    if request_line:
+                        print(("DEBUG: Received request: " + safe_unicode_convert(request_line)).encode('utf-8'))
+                        
+                        # 解析 URL 參數
+                        if "GET" in request_line and "/callback" in request_line:
+                            # 提取查詢參數
+                            query_string = ""
+                            if "?" in request_line:
+                                query_string = request_line.split("?")[1].split(" ")[0]
+                            
+                            # 解析參數
+                            params = {}
+                            if query_string:
+                                for param in query_string.split("&"):
+                                    if "=" in param:
+                                        key, value = param.split("=", 1)
+                                        params[urllib.unquote(key)] = urllib.unquote(value)
+                            
+                            # 檢查 state
+                            received_state = params.get("state", "")
+                            if received_state != expected_state:
+                                error_response = "HTTP/1.1 400 Bad Request\r\n\r\nInvalid state"
+                                client_socket.getOutputStream().write(error_response.encode('utf-8'))
+                                client_socket.close()
+                                return None
+                            
+                            # 獲取授權碼
+                            code = params.get("code", "")
+                            error = params.get("error", "")
+                            
+                            if error:
+                                error_response = "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n\r\n"
+                                error_response += "<html><body><h1>Authorization Failed</h1><p>" + error + "</p></body></html>"
+                                client_socket.getOutputStream().write(error_response.encode('utf-8'))
+                                client_socket.close()
+                                self._authorization_code_result = None
+                                return None
+                            
+                            if code:
+                                # 成功響應
+                                success_response = "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n\r\n"
+                                success_response += "<html><body><h1>Authorization Successful</h1><p>You can close this window.</p></body></html>"
+                                client_socket.getOutputStream().write(success_response.encode('utf-8'))
+                                client_socket.close()
+                                
+                                # 保存授權碼
+                                self._authorization_code_result = code
+                                return code
+                    
+                    if client_socket:
+                        client_socket.close()
+                except Exception as e:
+                    print(("DEBUG: Callback server error: " + safe_unicode_convert(str(e))).encode('utf-8'))
+                finally:
+                    try:
+                        if client_socket:
+                            client_socket.close()
+                        server_socket.close()
+                    except:
+                        pass
+            
+            # 啟動伺服器線程
+            self._authorization_code_result = None
+            server_thread = threading.Thread(target=handle_server)
+            server_thread.daemon = True
+            server_thread.start()
+            
+            return port
+            
+        except Exception as e:
+            print(("DEBUG: Failed to start callback server: " + safe_unicode_convert(str(e))).encode('utf-8'))
+            return None
+    
+    def _wait_for_authorization_code(self, port, expected_state, timeout=120):
+        """等待授權碼（最多等待 timeout 秒）"""
+        start_time = time.time()
+        while time.time() - start_time < timeout:
+            if hasattr(self, '_authorization_code_result') and self._authorization_code_result:
+                code = self._authorization_code_result
+                self._authorization_code_result = None
+                return code
+            time.sleep(0.5)
+        return None
+    
+    def _oauth2_exchange_code(self, authorization_code, client_id, client_secret, redirect_uri, code_verifier):
+        """使用授權碼交換 access token 和 refresh token"""
+        try:
+            # 確保 auth_method 設置為 oauth2，以便 _get_token_info() 使用正確的邏輯
+            self.config["auth_method"] = "oauth2"
+            
+            token_url = "https://oauth2.googleapis.com/token"
+            
+            data = {
+                "code": authorization_code,
+                "client_id": client_id,
+                "client_secret": client_secret,
+                "redirect_uri": redirect_uri,
+                "grant_type": "authorization_code",
+                "code_verifier": code_verifier
+            }
+            
+            post_data = urllib.urlencode(data)
+            
+            req = urllib2.Request(token_url, post_data)
+            req.add_header("Content-Type", "application/x-www-form-urlencoded")
+            
+            response = urllib2.urlopen(req)
+            response_body = response.read()
+            response_body_str = safe_unicode_convert(response_body)
+            
+            print(("DEBUG: Token exchange response: " + response_body_str[:200]).encode('utf-8'))
+            
+            result = json.loads(response_body_str)
+            
+            access_token = result.get("access_token", "")
+            refresh_token = result.get("refresh_token", "")
+            expires_in = result.get("expires_in", 3600)  # 預設 1 小時
+            
+            # 獲取 email（此時 auth_method 已設置為 oauth2）
+            email = None
+            if access_token:
+                print("DEBUG: Attempting to get email from token info...".encode('utf-8'))
+                token_info = self._get_token_info(access_token)
+                if token_info:
+                    email = token_info.get("email", "")
+                    if email:
+                        debug_email = u"DEBUG: Got email from token info: " + safe_unicode_convert(email)
+                        print(debug_email.encode('utf-8'))
+                    else:
+                        print("DEBUG: Token info did not return email".encode('utf-8'))
+                        # 嘗試使用 Google UserInfo API 獲取 email
+                        email = self._get_email_from_userinfo_api(access_token)
+                else:
+                    print("DEBUG: Failed to get token info".encode('utf-8'))
+                    # 嘗試使用 Google UserInfo API 獲取 email
+                    email = self._get_email_from_userinfo_api(access_token)
+            
+            return (access_token, refresh_token, expires_in, email)
+            
+        except urllib2.HTTPError as e:
+            error_body = e.read()
+            error_body_str = safe_unicode_convert(error_body)
+            print(("DEBUG: Token exchange HTTP error: " + safe_unicode_convert(str(e.code)) + " - " + error_body_str[:200]).encode('utf-8'))
+            return (None, None, None, None)
+        except Exception as e:
+            error_msg = safe_unicode_convert(str(e))
+            print(("DEBUG: Token exchange error: " + error_msg).encode('utf-8'))
+            import traceback
+            print(("DEBUG: Detailed stack trace: " + traceback.format_exc()).encode('utf-8'))
+            return (None, None, None, None)
+    
+    def _oauth2_refresh_token(self, refresh_token, client_id, client_secret):
+        """使用 refresh token 刷新 access token"""
+        try:
+            token_url = "https://oauth2.googleapis.com/token"
+            
+            data = {
+                "refresh_token": refresh_token,
+                "client_id": client_id,
+                "client_secret": client_secret,
+                "grant_type": "refresh_token"
+            }
+            
+            post_data = urllib.urlencode(data)
+            
+            req = urllib2.Request(token_url, post_data)
+            req.add_header("Content-Type", "application/x-www-form-urlencoded")
+            
+            response = urllib2.urlopen(req)
+            response_body = response.read()
+            response_body_str = safe_unicode_convert(response_body)
+            
+            print(("DEBUG: Token refresh response: " + response_body_str[:200]).encode('utf-8'))
+            
+            result = json.loads(response_body_str)
+            
+            access_token = result.get("access_token", "")
+            expires_in = result.get("expires_in", 3600)  # 預設 1 小時
+            
+            if access_token:
+                # 更新配置
+                self.config["access_token"] = access_token
+                self.config["token_expires_at"] = int(time.time()) + expires_in
+                self._save_token_to_file(access_token)
+                self._save_config_to_file()
+                
+                return (access_token, expires_in, None)
+            else:
+                return (None, None, u"無法從 refresh token 獲取新的 access token")
+                
+        except urllib2.HTTPError as e:
+            error_body = e.read()
+            error_body_str = safe_unicode_convert(error_body)
+            print(("DEBUG: Token refresh HTTP error: " + safe_unicode_convert(str(e.code)) + " - " + error_body_str[:200]).encode('utf-8'))
+            return (None, None, u"HTTP 錯誤: " + safe_unicode_convert(str(e.code)))
+        except Exception as e:
+            error_msg = safe_unicode_convert(str(e))
+            print(("DEBUG: Token refresh error: " + error_msg).encode('utf-8'))
+            import traceback
+            print(("DEBUG: Detailed stack trace: " + traceback.format_exc()).encode('utf-8'))
+            return (None, None, error_msg)
 
     def _get_spreadsheet_info(self):
         """獲取 Google Spreadsheet 的資訊（名稱和工作表列表）"""
@@ -974,7 +1705,10 @@ class BurpExtender(IBurpExtender, IContextMenuFactory):
             
             req = urllib2.Request(api_url)
             req.add_header("Authorization", "Bearer " + self.config["access_token"])
-            if self.config.get("project_id"):
+            # 只有使用 gcloud CLI 認證時才添加 x-goog-user-project header
+            # OAuth 2.0 認證不需要此 header，因為它是基於用戶授權的，不是項目授權
+            auth_method = self.config.get("auth_method", "gcloud")
+            if auth_method == "gcloud" and self.config.get("project_id"):
                 req.add_header("x-goog-user-project", self.config["project_id"])
             
             response = urllib2.urlopen(req)
@@ -1056,7 +1790,10 @@ class BurpExtender(IBurpExtender, IContextMenuFactory):
             
             req = urllib2.Request(api_url)
             req.add_header("Authorization", "Bearer " + self.config["access_token"])
-            if self.config.get("project_id"):
+            # 只有使用 gcloud CLI 認證時才添加 x-goog-user-project header
+            # OAuth 2.0 認證不需要此 header，因為它是基於用戶授權的，不是項目授權
+            auth_method = self.config.get("auth_method", "gcloud")
+            if auth_method == "gcloud" and self.config.get("project_id"):
                 req.add_header("x-goog-user-project", self.config["project_id"])
             
             response = urllib2.urlopen(req)
@@ -1168,7 +1905,9 @@ class BurpExtender(IBurpExtender, IContextMenuFactory):
                         # 重試請求
                         req_retry = urllib2.Request(api_url)
                         req_retry.add_header("Authorization", "Bearer " + self.config["access_token"])
-                        if self.config.get("project_id"):
+                        # 只有使用 gcloud CLI 認證時才添加 x-goog-user-project header
+                        auth_method = self.config.get("auth_method", "gcloud")
+                        if auth_method == "gcloud" and self.config.get("project_id"):
                             req_retry.add_header("x-goog-user-project", self.config["project_id"])
                         
                         response_retry = urllib2.urlopen(req_retry)
@@ -1251,8 +1990,27 @@ class BurpExtender(IBurpExtender, IContextMenuFactory):
         return 1
 
     def send_to_sheet(self, event):
+        # 檢查是否有任何配置文件存在
+        gcloud_config_file = self._get_config_file_path("gcloud")
+        oauth2_config_file = self._get_config_file_path("oauth2")
+        has_gcloud_config = os.path.exists(gcloud_config_file)
+        has_oauth2_config = os.path.exists(oauth2_config_file)
+        
+        # 如果沒有任何配置文件存在，強制顯示認證方式選擇對話框
+        if not has_gcloud_config and not has_oauth2_config:
+            # 顯示認證方式選擇對話框
+            choice = self._show_auth_method_selection_dialog()
+            if choice is None:
+                return  # 用戶取消選擇
+            self.config["auth_method"] = choice
+        
         if not self.config["sheet_id"] or not self.config["access_token"]:
-            if not self.show_config_dialog(): return
+            # 根據當前認證方式打開對應的配置對話框
+            auth_method = self.config.get("auth_method", "gcloud")
+            if auth_method == "oauth2":
+                if not self.show_oauth2_config_dialog(): return
+            else:
+                if not self.show_gcloud_config_dialog(): return
 
         http_traffic = self.context.getSelectedMessages()
         if not http_traffic: return
@@ -1454,7 +2212,10 @@ class BurpExtender(IBurpExtender, IContextMenuFactory):
             req_ijk.add_header("Content-Type", "application/json")
             req_ijk.add_header("Authorization", "Bearer " + self.config["access_token"])
             
-            if self.config["project_id"]:
+            # 只有使用 gcloud CLI 認證時才添加 x-goog-user-project header
+            # OAuth 2.0 認證不需要此 header，因為它是基於用戶授權的，不是項目授權
+            auth_method = self.config.get("auth_method", "gcloud")
+            if auth_method == "gcloud" and self.config.get("project_id"):
                 req_ijk.add_header("x-goog-user-project", self.config["project_id"])
             
             req_ijk.get_method = lambda: 'PUT'
@@ -1487,7 +2248,10 @@ class BurpExtender(IBurpExtender, IContextMenuFactory):
             req_op.add_header("Content-Type", "application/json")
             req_op.add_header("Authorization", "Bearer " + self.config["access_token"])
             
-            if self.config["project_id"]:
+            # 只有使用 gcloud CLI 認證時才添加 x-goog-user-project header
+            # OAuth 2.0 認證不需要此 header，因為它是基於用戶授權的，不是項目授權
+            auth_method = self.config.get("auth_method", "gcloud")
+            if auth_method == "gcloud" and self.config.get("project_id"):
                 req_op.add_header("x-goog-user-project", self.config["project_id"])
             
             req_op.get_method = lambda: 'PUT'
@@ -1519,7 +2283,9 @@ class BurpExtender(IBurpExtender, IContextMenuFactory):
                         req_ijk_retry = urllib2.Request(api_url_ijk, json_data_ijk)
                         req_ijk_retry.add_header("Content-Type", "application/json")
                         req_ijk_retry.add_header("Authorization", "Bearer " + self.config["access_token"])
-                        if self.config.get("project_id"):
+                        # 只有使用 gcloud CLI 認證時才添加 x-goog-user-project header
+                        auth_method = self.config.get("auth_method", "gcloud")
+                        if auth_method == "gcloud" and self.config.get("project_id"):
                             req_ijk_retry.add_header("x-goog-user-project", self.config["project_id"])
                         req_ijk_retry.get_method = lambda: 'PUT'
                         
@@ -1531,7 +2297,9 @@ class BurpExtender(IBurpExtender, IContextMenuFactory):
                         req_op_retry = urllib2.Request(api_url_op, json_data_op)
                         req_op_retry.add_header("Content-Type", "application/json")
                         req_op_retry.add_header("Authorization", "Bearer " + self.config["access_token"])
-                        if self.config.get("project_id"):
+                        # 只有使用 gcloud CLI 認證時才添加 x-goog-user-project header
+                        auth_method_retry = self.config.get("auth_method", "gcloud")
+                        if auth_method_retry == "gcloud" and self.config.get("project_id"):
                             req_op_retry.add_header("x-goog-user-project", self.config["project_id"])
                         req_op_retry.get_method = lambda: 'PUT'
                         

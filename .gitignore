@@ -40,8 +40,13 @@ Thumbs.db
 desktop.ini
 
 # Token 文件（包含敏感資訊）
-.burp_google_token.json
+.burp_google_token*.json
 *_token*.json
+.burp_google_config*.json
+
+# OAuth 2.0 Client Secret 文件（包含敏感資訊）
+*client_secret*.json
+client_secret*.json
 
 # 臨時文件
 *.tmp
