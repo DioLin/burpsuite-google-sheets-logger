@@ -87,7 +87,7 @@ class BurpExtender(IBurpExtender, IContextMenuFactory):
     def createMenuItems(self, invocation):
         self.context = invocation
         menu_list = ArrayList()
-        menu_send = JMenuItem(u"[G-Sheet] Send to I/J/K/O/P", actionPerformed=self.send_to_sheet)
+        menu_send = JMenuItem(u"[G-Sheet] Send to I/J/K/O/P/T", actionPerformed=self.send_to_sheet)
         menu_gcloud_config = JMenuItem(u"[G-Sheet] Google CLI Configuration", actionPerformed=self.show_gcloud_config_dialog)
         menu_oauth2_config = JMenuItem(u"[G-Sheet] OAuth 2.0 Configuration", actionPerformed=self.show_oauth2_config_dialog)
         menu_list.add(menu_send)
@@ -1178,7 +1178,19 @@ class BurpExtender(IBurpExtender, IContextMenuFactory):
                 items = result["items"]
                 sheets_list = []
                 # 提取 nickname 並保存到 config
-                nickname = safe_unicode_convert(result.get("nickname", ""))
+                nickname_raw = result.get("nickname", "")
+                # 如果 nickname 是列表/陣列，只取第 1 筆
+                if isinstance(nickname_raw, (list, tuple)) and len(nickname_raw) > 0:
+                    nickname_str = safe_unicode_convert(nickname_raw[0])
+                else:
+                    nickname_str = safe_unicode_convert(nickname_raw)
+                
+                # 如果 nickname 字串中包含逗號，只取逗號前的第 1 個值
+                if nickname_str and "," in nickname_str:
+                    nickname = nickname_str.split(",")[0].strip()
+                else:
+                    nickname = nickname_str
+                
                 if nickname:
                     self.config["nickname"] = nickname
                     self._save_config_to_file()
@@ -2163,6 +2175,7 @@ class BurpExtender(IBurpExtender, IContextMenuFactory):
                 "url": txt_url.getText(),
                 "param": txt_param.getText(),
                 "syntax": txt_syntax.getText(),
+                "request": full_req,  # T 欄位：使用 Burp Suite 最初取得的完整原始請求內容（未經使用者修改）
                 "tester": txt_tester.getText().strip(),
                 "discovery_date": discovery_date,
                 "target_row": target_row,
@@ -2276,13 +2289,47 @@ class BurpExtender(IBurpExtender, IContextMenuFactory):
             response_body_op = response_op.read()
             result_op = json.loads(response_body_op)
             
-            if "updatedCells" in result_ijk and "updatedCells" in result_op:
-                success_msg = u"成功寫入到 " + safe_unicode_convert(target_sheet) + u" 行 " + str(target_row) + u" (欄位 I, J, K, O, P)!"
+            # 寫入 T 欄位（原始 request 內容，與 K 欄位相同）
+            range_str_t = target_sheet_unicode + u"!T" + safe_unicode_convert(str(target_row))
+            encoded_range_t = urllib.quote(range_str_t.encode('utf-8'))
+            
+            debug_t = u"DEBUG: Preparing to write to row " + safe_unicode_convert(str(target_row)) + u", range T: " + range_str_t
+            print(debug_t.encode('utf-8'))
+            
+            api_url_t = "https://sheets.googleapis.com/v4/spreadsheets/{}/values/{}?valueInputOption=USER_ENTERED".format(
+                self.config["sheet_id"],
+                encoded_range_t
+            )
+            
+            debug_url_t = u"DEBUG: API URL T: " + safe_unicode_convert(api_url_t)
+            print(debug_url_t.encode('utf-8'))
+            
+            row_values_t = [data["request"]]
+            json_data_t = json.dumps({"values": [row_values_t]})
+            
+            req_t = urllib2.Request(api_url_t, json_data_t)
+            req_t.add_header("Content-Type", "application/json")
+            req_t.add_header("Authorization", "Bearer " + self.config["access_token"])
+            
+            # 只有使用 gcloud CLI 認證時才添加 x-goog-user-project header
+            auth_method = self.config.get("auth_method", "gcloud")
+            if auth_method == "gcloud" and self.config.get("project_id"):
+                req_t.add_header("x-goog-user-project", self.config["project_id"])
+            
+            req_t.get_method = lambda: 'PUT'
+            
+            response_t = urllib2.urlopen(req_t)
+            response_body_t = response_t.read()
+            result_t = json.loads(response_body_t)
+            
+            if "updatedCells" in result_ijk and "updatedCells" in result_op and "updatedCells" in result_t:
+                success_msg = u"成功寫入到 " + safe_unicode_convert(target_sheet) + u" 行 " + str(target_row) + u" (欄位 I, J, K, O, P, T)!"
                 print(safe_unicode_convert(success_msg).encode('utf-8'))
                 self._callbacks.issueAlert(safe_unicode_convert(success_msg))
             else:
                 print("DEBUG: API response I:K: " + response_body_ijk)
                 print("DEBUG: API response O:P: " + response_body_op)
+                print("DEBUG: API response T: " + response_body_t)
                 
         except urllib2.HTTPError as e:
             error_body = e.read()
@@ -2323,8 +2370,22 @@ class BurpExtender(IBurpExtender, IContextMenuFactory):
                         response_body_op_retry = response_op_retry.read()
                         result_op_retry = json.loads(response_body_op_retry)
                         
-                        if "updatedCells" in result_ijk_retry and "updatedCells" in result_op_retry:
-                            success_msg = u"Token 刷新後重試成功！成功寫入到 " + safe_unicode_convert(target_sheet) + u" 行 " + str(target_row) + u" (欄位 I, J, K, O, P)!"
+                        # 重試寫入 T 欄位
+                        req_t_retry = urllib2.Request(api_url_t, json_data_t)
+                        req_t_retry.add_header("Content-Type", "application/json")
+                        req_t_retry.add_header("Authorization", "Bearer " + self.config["access_token"])
+                        # 只有使用 gcloud CLI 認證時才添加 x-goog-user-project header
+                        auth_method_retry = self.config.get("auth_method", "gcloud")
+                        if auth_method_retry == "gcloud" and self.config.get("project_id"):
+                            req_t_retry.add_header("x-goog-user-project", self.config["project_id"])
+                        req_t_retry.get_method = lambda: 'PUT'
+                        
+                        response_t_retry = urllib2.urlopen(req_t_retry)
+                        response_body_t_retry = response_t_retry.read()
+                        result_t_retry = json.loads(response_body_t_retry)
+                        
+                        if "updatedCells" in result_ijk_retry and "updatedCells" in result_op_retry and "updatedCells" in result_t_retry:
+                            success_msg = u"Token 刷新後重試成功！成功寫入到 " + safe_unicode_convert(target_sheet) + u" 行 " + str(target_row) + u" (欄位 I, J, K, O, P, T)!"
                             print(safe_unicode_convert(success_msg).encode('utf-8'))
                             self._callbacks.issueAlert(safe_unicode_convert(success_msg))
                             return
