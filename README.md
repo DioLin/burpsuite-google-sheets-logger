@@ -235,4 +235,4 @@ gcloud auth application-default print-access-token
 
 ---
 
-**最後更新**: 2025年1月
+**最後更新**: 2025年12月
