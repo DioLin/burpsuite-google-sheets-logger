@@ -71,6 +71,7 @@ class BurpExtender(IBurpExtender, IContextMenuFactory):
             "project_id": "chtpt-burp-logger-001",
             "sheet_name": u"弱點清單",
             "email": "",
+            "nickname": "",  # 從 API 查詢獲取的 nickname，用於預設測試人員
             "auth_method": "gcloud",  # "gcloud" or "oauth2"
             "oauth2_client_id": "",
             "oauth2_client_secret": "",
@@ -386,8 +387,10 @@ class BurpExtender(IBurpExtender, IContextMenuFactory):
                 "sheet_id": safe_unicode_convert(self.config.get("sheet_id", "")),
                 "sheet_name": safe_unicode_convert(self.config.get("sheet_name", "")),
                 "email": safe_unicode_convert(self.config.get("email", "")),
+                "nickname": safe_unicode_convert(self.config.get("nickname", "")),
                 "auth_method": safe_unicode_convert(self.config.get("auth_method", "gcloud")),
                 "oauth2_client_id": safe_unicode_convert(self.config.get("oauth2_client_id", "")),
+                "oauth2_client_secret": safe_unicode_convert(self.config.get("oauth2_client_secret", "")),  # 保存 Client Secret 以便下次使用（注意：包含敏感資訊）
                 "saved_at": time.time()
             }
             # 只有使用 gcloud CLI 認證時才保存 project_id
@@ -446,10 +449,14 @@ class BurpExtender(IBurpExtender, IContextMenuFactory):
                         self.config["sheet_name"] = safe_unicode_convert(config_data.get("sheet_name", ""))
                     if "email" in config_data:
                         self.config["email"] = safe_unicode_convert(config_data.get("email", ""))
+                    if "nickname" in config_data:
+                        self.config["nickname"] = safe_unicode_convert(config_data.get("nickname", ""))
                     if "auth_method" in config_data:
                         self.config["auth_method"] = safe_unicode_convert(config_data.get("auth_method", "gcloud"))
                     if "oauth2_client_id" in config_data:
                         self.config["oauth2_client_id"] = safe_unicode_convert(config_data.get("oauth2_client_id", ""))
+                    if "oauth2_client_secret" in config_data:
+                        self.config["oauth2_client_secret"] = safe_unicode_convert(config_data.get("oauth2_client_secret", ""))
                     print("DEBUG: Configuration loaded from file")
         except Exception as e:
             print("DEBUG: Failed to load configuration: " + str(e))
@@ -1170,6 +1177,14 @@ class BurpExtender(IBurpExtender, IContextMenuFactory):
             if result.get("status") == "ok" and "items" in result:
                 items = result["items"]
                 sheets_list = []
+                # 提取 nickname 並保存到 config
+                nickname = safe_unicode_convert(result.get("nickname", ""))
+                if nickname:
+                    self.config["nickname"] = nickname
+                    self._save_config_to_file()
+                    debug_nickname = u"DEBUG: Saved nickname to config: " + nickname
+                    print(debug_nickname.encode('utf-8'))
+                
                 for item in items:
                     project = safe_unicode_convert(item.get("project", ""))
                     sheetid = safe_unicode_convert(item.get("sheetid", ""))
@@ -2087,8 +2102,9 @@ class BurpExtender(IBurpExtender, IContextMenuFactory):
         panel.add(JLabel(u"Request (K):"))
         panel.add(scroll_syntax)
         panel.add(Box.createVerticalStrut(5))
-        # 添加測試人員輸入框
-        txt_tester = JTextField("", 40)
+        # 添加測試人員輸入框（預設使用 config 中的 nickname）
+        default_tester = self.config.get("nickname", "")
+        txt_tester = JTextField(default_tester, 40)
         panel.add(JLabel(u"測試人員 (O):"))
         panel.add(txt_tester)
         panel.add(Box.createVerticalStrut(5))
