@@ -75,7 +75,9 @@ class BurpExtender(IBurpExtender, IContextMenuFactory):
             "auth_method": "gcloud",  # "gcloud" or "oauth2"
             "oauth2_client_id": "",
             "oauth2_client_secret": "",
-            "token_expires_at": 0  # Unix timestamp
+            "token_expires_at": 0,  # Unix timestamp
+            "custom_sheet_name": "",  # 自定義功能使用的分頁名稱
+            "custom_columns": ""  # 自定義欄位，以逗號分隔，如 "I,J,K,L"
         }
         
         # 載入已保存的配置
@@ -88,9 +90,15 @@ class BurpExtender(IBurpExtender, IContextMenuFactory):
         self.context = invocation
         menu_list = ArrayList()
         menu_send = JMenuItem(u"[G-Sheet] Send to I/J/K/O/P/T", actionPerformed=self.send_to_sheet)
+        menu_read_t = JMenuItem(u"[G-Sheet] Read T to Repeater", actionPerformed=self.read_t_to_repeater)
+        menu_custom = JMenuItem(u"[G-Sheet] Send to Custom Columns", actionPerformed=self.send_to_custom_columns)
+        menu_custom_config = JMenuItem(u"[G-Sheet] Custom Columns Configuration", actionPerformed=self.show_custom_columns_config_dialog)
         menu_gcloud_config = JMenuItem(u"[G-Sheet] Google CLI Configuration", actionPerformed=self.show_gcloud_config_dialog)
         menu_oauth2_config = JMenuItem(u"[G-Sheet] OAuth 2.0 Configuration", actionPerformed=self.show_oauth2_config_dialog)
         menu_list.add(menu_send)
+        menu_list.add(menu_read_t)
+        menu_list.add(menu_custom)
+        menu_list.add(menu_custom_config)
         menu_list.add(menu_gcloud_config)
         menu_list.add(menu_oauth2_config)
         return menu_list
@@ -391,6 +399,8 @@ class BurpExtender(IBurpExtender, IContextMenuFactory):
                 "auth_method": safe_unicode_convert(self.config.get("auth_method", "gcloud")),
                 "oauth2_client_id": safe_unicode_convert(self.config.get("oauth2_client_id", "")),
                 "oauth2_client_secret": safe_unicode_convert(self.config.get("oauth2_client_secret", "")),  # 保存 Client Secret 以便下次使用（注意：包含敏感資訊）
+                "custom_sheet_name": safe_unicode_convert(self.config.get("custom_sheet_name", "")),
+                "custom_columns": safe_unicode_convert(self.config.get("custom_columns", "")),
                 "saved_at": time.time()
             }
             # 只有使用 gcloud CLI 認證時才保存 project_id
@@ -457,6 +467,10 @@ class BurpExtender(IBurpExtender, IContextMenuFactory):
                         self.config["oauth2_client_id"] = safe_unicode_convert(config_data.get("oauth2_client_id", ""))
                     if "oauth2_client_secret" in config_data:
                         self.config["oauth2_client_secret"] = safe_unicode_convert(config_data.get("oauth2_client_secret", ""))
+                    if "custom_sheet_name" in config_data:
+                        self.config["custom_sheet_name"] = safe_unicode_convert(config_data.get("custom_sheet_name", ""))
+                    if "custom_columns" in config_data:
+                        self.config["custom_columns"] = safe_unicode_convert(config_data.get("custom_columns", ""))
                     print("DEBUG: Configuration loaded from file")
         except Exception as e:
             print("DEBUG: Failed to load configuration: " + str(e))
@@ -525,7 +539,35 @@ class BurpExtender(IBurpExtender, IContextMenuFactory):
                                 self._save_config_to_file()
                             print("DEBUG: Valid token loaded from file".encode('utf-8'))
                         else:
-                            print("DEBUG: Token in file has expired, need to re-acquire".encode('utf-8'))
+                            # Token 過期，嘗試自動獲取新 token
+                            print("DEBUG: Token in file has expired, attempting to auto-refresh...".encode('utf-8'))
+                            auth_method = self.config.get("auth_method", "gcloud")
+                            
+                            if auth_method == "gcloud":
+                                # 使用 gcloud 自動獲取新 token
+                                try:
+                                    new_token, error = self._get_gcloud_token()
+                                    if new_token:
+                                        # 驗證新 token
+                                        if self._check_token_valid(new_token):
+                                            self.config["access_token"] = new_token
+                                            # 獲取並保存 email
+                                            token_info = self._get_token_info(new_token)
+                                            if token_info and token_info.get("email"):
+                                                self.config["email"] = token_info["email"]
+                                                self._save_config_to_file()
+                                            print("DEBUG: Successfully refreshed expired token from file".encode('utf-8'))
+                                        else:
+                                            print("DEBUG: Newly obtained token failed validation".encode('utf-8'))
+                                    else:
+                                        error_msg = u"Unable to refresh expired token: " + safe_unicode_convert(error or u"Unknown error")
+                                        print(("DEBUG: " + error_msg).encode('utf-8'))
+                                except Exception as e:
+                                    error_msg = u"Exception while refreshing expired token: " + safe_unicode_convert(str(e))
+                                    print(("DEBUG: " + error_msg).encode('utf-8'))
+                            else:
+                                # OAuth 2.0 需要手動刷新（因為需要用戶授權）
+                                print("DEBUG: OAuth 2.0 token expired, please refresh manually in Configuration".encode('utf-8'))
         except Exception as e:
             error_msg = u"Failed to load token: " + safe_unicode_convert(str(e))
             print(("DEBUG: " + error_msg).encode('utf-8'))
@@ -2016,6 +2058,278 @@ class BurpExtender(IBurpExtender, IContextMenuFactory):
             return rows_data[-1]["row_num"] + 1
         return 1
 
+    def _read_cell_t_column(self, row_num):
+        """讀取指定列的 T 欄位內容"""
+        try:
+            # 檢查必要的配置
+            if not self.config.get("sheet_id"):
+                error_msg = u"Sheet ID 未設置"
+                print(("DEBUG: " + error_msg).encode('utf-8'))
+                return None
+            
+            if not self.config.get("access_token"):
+                error_msg = u"Access Token 未設置"
+                print(("DEBUG: " + error_msg).encode('utf-8'))
+                return None
+            
+            # 確保 token 有效
+            if not self._ensure_valid_token():
+                error_msg = u"Token 無效且無法刷新，請手動獲取新 token"
+                print(("DEBUG: " + error_msg).encode('utf-8'))
+                return None
+            
+            target_sheet = self.config.get("sheet_name", u"弱點清單")
+            sheet_id = self.config.get("sheet_id", "")
+            
+            # 構建範圍字符串：工作表名稱!T{row_num}（T 欄位是第 20 欄，索引從 1 開始）
+            target_sheet_unicode = safe_unicode_convert(target_sheet)
+            range_str = target_sheet_unicode + u"!T" + safe_unicode_convert(str(row_num))
+            encoded_range = urllib.quote(range_str.encode('utf-8'))
+            
+            api_url = "https://sheets.googleapis.com/v4/spreadsheets/{}/values/{}".format(
+                sheet_id,
+                encoded_range
+            )
+            
+            debug_url = u"DEBUG: Reading T column API URL: " + safe_unicode_convert(api_url)
+            print(debug_url.encode('utf-8'))
+            
+            req = urllib2.Request(api_url)
+            req.add_header("Authorization", "Bearer " + self.config["access_token"])
+            # 只有使用 gcloud CLI 認證時才添加 x-goog-user-project header
+            auth_method = self.config.get("auth_method", "gcloud")
+            if auth_method == "gcloud" and self.config.get("project_id"):
+                req.add_header("x-goog-user-project", self.config["project_id"])
+            
+            response = urllib2.urlopen(req)
+            response_body = response.read()
+            response_body_str = safe_unicode_convert(response_body)
+            
+            result = json.loads(response_body_str)
+            
+            # 提取 T 欄位的值
+            if "values" in result and len(result["values"]) > 0:
+                row_values = result["values"][0]
+                if len(row_values) > 0:
+                    t_value = safe_unicode_convert(row_values[0])
+                    debug_value = u"DEBUG: Successfully read T column value for row " + safe_unicode_convert(str(row_num))
+                    print(debug_value.encode('utf-8'))
+                    return t_value
+            
+            debug_empty = u"DEBUG: T column is empty for row " + safe_unicode_convert(str(row_num))
+            print(debug_empty.encode('utf-8'))
+            return None
+            
+        except urllib2.HTTPError as e:
+            error_code = e.code
+            error_body = e.read()
+            error_body_str = safe_unicode_convert(error_body)
+            debug_error = u"DEBUG: HTTP error " + safe_unicode_convert(str(error_code)) + u" while reading T column"
+            print(debug_error.encode('utf-8'))
+            
+            if error_code == 401:
+                # 嘗試刷新 token 並重試一次
+                if self._ensure_valid_token():
+                    try:
+                        req_retry = urllib2.Request(api_url)
+                        req_retry.add_header("Authorization", "Bearer " + self.config["access_token"])
+                        auth_method = self.config.get("auth_method", "gcloud")
+                        if auth_method == "gcloud" and self.config.get("project_id"):
+                            req_retry.add_header("x-goog-user-project", self.config["project_id"])
+                        
+                        response_retry = urllib2.urlopen(req_retry)
+                        response_body_retry = response_retry.read()
+                        response_body_str_retry = safe_unicode_convert(response_body_retry)
+                        result_retry = json.loads(response_body_str_retry)
+                        
+                        if "values" in result_retry and len(result_retry["values"]) > 0:
+                            row_values = result_retry["values"][0]
+                            if len(row_values) > 0:
+                                return safe_unicode_convert(row_values[0])
+                    except:
+                        pass
+            
+            return None
+        except Exception as e:
+            error_msg = u"讀取 T 欄位時發生錯誤: " + safe_unicode_convert(str(e))
+            print(("DEBUG: " + error_msg).encode('utf-8'))
+            return None
+
+    def _read_cell_value(self, row_num, column_letter, sheet_name=None):
+        """讀取指定列和欄位的內容（通用方法）"""
+        try:
+            # 檢查必要的配置
+            if not self.config.get("sheet_id"):
+                return None
+            
+            if not self.config.get("access_token"):
+                return None
+            
+            # 確保 token 有效
+            if not self._ensure_valid_token():
+                return None
+            
+            # 如果沒有指定 sheet_name，使用默認的
+            if sheet_name is None:
+                target_sheet = self.config.get("sheet_name", u"弱點清單")
+            else:
+                target_sheet = sheet_name
+            sheet_id = self.config.get("sheet_id", "")
+            
+            # 構建範圍字符串：工作表名稱!{column_letter}{row_num}
+            target_sheet_unicode = safe_unicode_convert(target_sheet)
+            range_str = target_sheet_unicode + u"!" + safe_unicode_convert(column_letter) + safe_unicode_convert(str(row_num))
+            encoded_range = urllib.quote(range_str.encode('utf-8'))
+            
+            api_url = "https://sheets.googleapis.com/v4/spreadsheets/{}/values/{}".format(
+                sheet_id,
+                encoded_range
+            )
+            
+            req = urllib2.Request(api_url)
+            req.add_header("Authorization", "Bearer " + self.config["access_token"])
+            # 只有使用 gcloud CLI 認證時才添加 x-goog-user-project header
+            auth_method = self.config.get("auth_method", "gcloud")
+            if auth_method == "gcloud" and self.config.get("project_id"):
+                req.add_header("x-goog-user-project", self.config["project_id"])
+            
+            response = urllib2.urlopen(req)
+            response_body = response.read()
+            response_body_str = safe_unicode_convert(response_body)
+            
+            result = json.loads(response_body_str)
+            
+            # 提取欄位的值
+            if "values" in result and len(result["values"]) > 0:
+                row_values = result["values"][0]
+                if len(row_values) > 0:
+                    value = safe_unicode_convert(row_values[0])
+                    return value
+            
+            return None
+            
+        except urllib2.HTTPError as e:
+            # 如果是 401 錯誤，嘗試刷新 token 並重試一次
+            if e.code == 401:
+                if self._ensure_valid_token():
+                    try:
+                        req_retry = urllib2.Request(api_url)
+                        req_retry.add_header("Authorization", "Bearer " + self.config["access_token"])
+                        auth_method = self.config.get("auth_method", "gcloud")
+                        if auth_method == "gcloud" and self.config.get("project_id"):
+                            req_retry.add_header("x-goog-user-project", self.config["project_id"])
+                        
+                        response_retry = urllib2.urlopen(req_retry)
+                        response_body_retry = response_retry.read()
+                        response_body_str_retry = safe_unicode_convert(response_body_retry)
+                        result_retry = json.loads(response_body_str_retry)
+                        
+                        if "values" in result_retry and len(result_retry["values"]) > 0:
+                            row_values = result_retry["values"][0]
+                            if len(row_values) > 0:
+                                return safe_unicode_convert(row_values[0])
+                    except:
+                        pass
+            return None
+        except Exception as e:
+            # 讀取失敗時不顯示錯誤，靜默返回 None
+            return None
+
+    def _read_column_headers(self, sheet_name):
+        """讀取指定分頁第一列的欄位名稱"""
+        try:
+            if not self.config.get("sheet_id"):
+                return None
+            
+            if not self.config.get("access_token"):
+                return None
+            
+            if not self._ensure_valid_token():
+                return None
+            
+            sheet_id = self.config.get("sheet_id", "")
+            target_sheet_unicode = safe_unicode_convert(sheet_name)
+            
+            # 讀取第一列（假設最多讀取 26 欄，A-Z）
+            range_str = target_sheet_unicode + u"!1:1"
+            encoded_range = urllib.quote(range_str.encode('utf-8'))
+            
+            api_url = "https://sheets.googleapis.com/v4/spreadsheets/{}/values/{}".format(
+                sheet_id,
+                encoded_range
+            )
+            
+            req = urllib2.Request(api_url)
+            req.add_header("Authorization", "Bearer " + self.config["access_token"])
+            auth_method = self.config.get("auth_method", "gcloud")
+            if auth_method == "gcloud" and self.config.get("project_id"):
+                req.add_header("x-goog-user-project", self.config["project_id"])
+            
+            response = urllib2.urlopen(req)
+            response_body = response.read()
+            response_body_str = safe_unicode_convert(response_body)
+            result = json.loads(response_body_str)
+            
+            if "values" in result and len(result["values"]) > 0:
+                headers = result["values"][0]
+                return [safe_unicode_convert(h) if h else u"" for h in headers]
+            
+            return None
+        except Exception as e:
+            print(("DEBUG: Error reading column headers: " + safe_unicode_convert(str(e))).encode('utf-8'))
+            return None
+
+    def show_custom_columns_config_dialog(self, event=None):
+        """顯示自定義欄位配置對話框"""
+        panel = JPanel()
+        panel.setLayout(BoxLayout(panel, BoxLayout.Y_AXIS))
+        
+        # Sheet 分頁名稱輸入框
+        txt_sheet_name = JTextField(safe_unicode_convert(self.config.get("custom_sheet_name", "")), 40)
+        panel.add(JLabel(u"Sheet 分頁名稱:"))
+        panel.add(txt_sheet_name)
+        panel.add(Box.createVerticalStrut(5))
+        
+        # 欄位輸入框（如 I,J,K,L）
+        txt_columns = JTextField(safe_unicode_convert(self.config.get("custom_columns", "")), 40)
+        panel.add(JLabel(u"欄位（逗號分隔，如 I,J,K,L）:"))
+        panel.add(txt_columns)
+        panel.add(Box.createVerticalStrut(10))
+        
+        result = JOptionPane.showConfirmDialog(
+            None,
+            panel,
+            u"自定義欄位配置",
+            JOptionPane.OK_CANCEL_OPTION
+        )
+        
+        if result == JOptionPane.OK_OPTION:
+            sheet_name = txt_sheet_name.getText().strip()
+            columns = txt_columns.getText().strip()
+            
+            if not sheet_name:
+                JOptionPane.showMessageDialog(None, u"請輸入 Sheet 分頁名稱", u"錯誤", JOptionPane.ERROR_MESSAGE)
+                return False
+            
+            if not columns:
+                JOptionPane.showMessageDialog(None, u"請輸入欄位", u"錯誤", JOptionPane.ERROR_MESSAGE)
+                return False
+            
+            # 驗證欄位格式（簡單檢查）
+            columns_list = [c.strip().upper() for c in columns.split(',') if c.strip()]
+            if not columns_list:
+                JOptionPane.showMessageDialog(None, u"欄位格式不正確", u"錯誤", JOptionPane.ERROR_MESSAGE)
+                return False
+            
+            # 保存配置
+            self.config["custom_sheet_name"] = safe_unicode_convert(sheet_name)
+            self.config["custom_columns"] = safe_unicode_convert(columns)
+            self._save_config_to_file()
+            
+            return True
+        
+        return False
+
     def send_to_sheet(self, event):
         # 檢查是否有任何配置文件存在
         gcloud_config_file = self._get_config_file_path("gcloud")
@@ -2183,6 +2497,486 @@ class BurpExtender(IBurpExtender, IContextMenuFactory):
             }
             t = threading.Thread(target=self.post_to_api, args=(data,))
             t.start()
+
+    def send_to_custom_columns(self, event):
+        """發送數據到自定義欄位"""
+        # 檢查是否有任何配置文件存在
+        gcloud_config_file = self._get_config_file_path("gcloud")
+        oauth2_config_file = self._get_config_file_path("oauth2")
+        has_gcloud_config = os.path.exists(gcloud_config_file)
+        has_oauth2_config = os.path.exists(oauth2_config_file)
+        
+        # 如果沒有任何配置文件存在，強制顯示認證方式選擇對話框
+        if not has_gcloud_config and not has_oauth2_config:
+            choice = self._show_auth_method_selection_dialog()
+            if choice is None:
+                return
+            self.config["auth_method"] = choice
+        
+        # 檢查基本配置
+        if not self.config["sheet_id"] or not self.config["access_token"]:
+            auth_method = self.config.get("auth_method", "gcloud")
+            if auth_method == "oauth2":
+                if not self.show_oauth2_config_dialog(): return
+            else:
+                if not self.show_gcloud_config_dialog(): return
+        
+        # 檢查自定義配置
+        custom_sheet_name = self.config.get("custom_sheet_name", "")
+        custom_columns = self.config.get("custom_columns", "")
+        
+        if not custom_sheet_name or not custom_columns:
+            if not self.show_custom_columns_config_dialog():
+                return
+        
+        custom_sheet_name = self.config.get("custom_sheet_name", "")
+        custom_columns = self.config.get("custom_columns", "")
+        
+        # 讀取第一列的欄位名稱
+        headers = self._read_column_headers(custom_sheet_name)
+        
+        if not headers:
+            JOptionPane.showMessageDialog(
+                None,
+                u"無法讀取分頁 '" + custom_sheet_name + u"' 的欄位名稱",
+                u"錯誤",
+                JOptionPane.ERROR_MESSAGE
+            )
+            return
+        
+        # 解析欄位列表
+        columns_list = [c.strip().upper() for c in custom_columns.split(',') if c.strip()]
+        
+        # 預設行號為 2（第一列通常是標題）
+        default_row = 2
+        
+        # 創建輸入對話框
+        panel = JPanel()
+        panel.setLayout(BoxLayout(panel, BoxLayout.Y_AXIS))
+        
+        # 顯示分頁名稱和欄位信息
+        panel.add(JLabel(u"分頁名稱: " + custom_sheet_name))
+        panel.add(Box.createVerticalStrut(5))
+        
+        # 顯示欄位標題
+        column_info = u"欄位: " + custom_columns
+        panel.add(JLabel(column_info))
+        panel.add(Box.createVerticalStrut(10))
+        
+        # 為每個欄位創建輸入框
+        input_fields = {}
+        for i, col in enumerate(columns_list):
+            # 嘗試找到對應的欄位標題（如果有）
+            header_text = u""
+            col_index = ord(col) - ord('A')  # A=0, B=1, ...
+            if col_index < len(headers) and headers[col_index]:
+                header_text = u" (" + headers[col_index] + u")"
+            
+            label = JLabel(u"欄位 " + col + header_text + u":")
+            txt_field = JTextField("", 40)
+            panel.add(label)
+            panel.add(txt_field)
+            panel.add(Box.createVerticalStrut(5))
+            input_fields[col] = txt_field
+        
+        # 項次（行號）輸入框
+        txt_row = JTextField(str(default_row), 10)
+        panel.add(Box.createVerticalStrut(5))
+        panel.add(JLabel(u"項次（行號）:"))
+        panel.add(txt_row)
+        
+        if JOptionPane.showConfirmDialog(
+            None,
+            panel,
+            u"Send to Custom Columns - " + custom_sheet_name,
+            JOptionPane.OK_CANCEL_OPTION
+        ) == JOptionPane.OK_OPTION:
+            # 獲取目標行號
+            target_row = txt_row.getText().strip()
+            try:
+                target_row = int(target_row)
+                if target_row < 1:
+                    raise ValueError("Row number must be >= 1")
+            except ValueError:
+                JOptionPane.showMessageDialog(None, u"行號必須是正整數", u"錯誤", JOptionPane.ERROR_MESSAGE)
+                return
+            
+            # 收集輸入的值
+            values = []
+            for col in columns_list:
+                value = input_fields[col].getText().strip()
+                values.append(value)
+            
+            # 讀取目標行的現有值，用於確認對話框
+            existing_values = {}
+            for col in columns_list:
+                existing_value = self._read_cell_value(target_row, col, custom_sheet_name)
+                existing_values[col] = existing_value if existing_value else u"（空）"
+            
+            # 構建確認對話框
+            confirm_panel = JPanel()
+            confirm_panel.setLayout(BoxLayout(confirm_panel, BoxLayout.Y_AXIS))
+            
+            confirm_panel.add(JLabel(u"確認覆蓋數據"))
+            confirm_panel.add(Box.createVerticalStrut(10))
+            confirm_panel.add(JLabel(u"表單名稱: " + custom_sheet_name))
+            confirm_panel.add(JLabel(u"行號: " + str(target_row)))
+            confirm_panel.add(Box.createVerticalStrut(10))
+            
+            # 顯示原有值和新值
+            info_text = u"原有欄位值：\n"
+            for i, col in enumerate(columns_list):
+                header_text = u""
+                col_index = ord(col) - ord('A')
+                if col_index < len(headers) and headers[col_index]:
+                    header_text = u" (" + headers[col_index] + u")"
+                existing_val = existing_values.get(col, u"（空）")
+                new_val = values[i] if i < len(values) else u""
+                info_text += u"欄位 " + col + header_text + u": " + existing_val + u"\n"
+            
+            info_text += u"\n新欄位值：\n"
+            for i, col in enumerate(columns_list):
+                header_text = u""
+                col_index = ord(col) - ord('A')
+                if col_index < len(headers) and headers[col_index]:
+                    header_text = u" (" + headers[col_index] + u")"
+                new_val = values[i] if i < len(values) else u"（空）"
+                info_text += u"欄位 " + col + header_text + u": " + new_val + u"\n"
+            
+            txt_info = JTextArea(info_text)
+            txt_info.setLineWrap(True)
+            txt_info.setEditable(False)
+            scroll_info = JScrollPane(txt_info)
+            scroll_info.setPreferredSize(Dimension(500, 300))
+            confirm_panel.add(scroll_info)
+            
+            # 顯示確認對話框
+            confirm_result = JOptionPane.showConfirmDialog(
+                None,
+                confirm_panel,
+                u"確認覆蓋",
+                JOptionPane.YES_NO_OPTION,
+                JOptionPane.WARNING_MESSAGE
+            )
+            
+            if confirm_result != JOptionPane.YES_OPTION:
+                return  # 用戶取消確認
+            
+            # 構建數據並發送到 API
+            data = {
+                "target_sheet": custom_sheet_name,
+                "target_row": target_row,
+                "columns": columns_list,
+                "values": values
+            }
+            
+            t = threading.Thread(target=self.post_to_custom_columns_api, args=(data,))
+            t.start()
+
+    def read_t_to_repeater(self, event):
+        """讀取指定列的 T 欄位內容並發送到 Burp Suite Repeater"""
+        # 檢查是否有任何配置文件存在
+        gcloud_config_file = self._get_config_file_path("gcloud")
+        oauth2_config_file = self._get_config_file_path("oauth2")
+        has_gcloud_config = os.path.exists(gcloud_config_file)
+        has_oauth2_config = os.path.exists(oauth2_config_file)
+        
+        # 如果沒有任何配置文件存在，強制顯示認證方式選擇對話框
+        if not has_gcloud_config and not has_oauth2_config:
+            # 顯示認證方式選擇對話框
+            choice = self._show_auth_method_selection_dialog()
+            if choice is None:
+                return  # 用戶取消選擇
+            self.config["auth_method"] = choice
+        
+        # 檢查配置
+        if not self.config["sheet_id"] or not self.config["access_token"]:
+            # 根據當前認證方式打開對應的配置對話框
+            auth_method = self.config.get("auth_method", "gcloud")
+            if auth_method == "oauth2":
+                if not self.show_oauth2_config_dialog(): return
+            else:
+                if not self.show_gcloud_config_dialog(): return
+        
+        # 顯示對話框讓用戶輸入列號
+        panel = JPanel()
+        panel.setLayout(BoxLayout(panel, BoxLayout.Y_AXIS))
+        txt_row = JTextField("", 10)
+        panel.add(JLabel(u"請輸入要讀取的列號 (行號):"))
+        panel.add(txt_row)
+        
+        result = JOptionPane.showConfirmDialog(
+            None, 
+            panel, 
+            u"Read T to Repeater", 
+            JOptionPane.OK_CANCEL_OPTION
+        )
+        
+        if result != JOptionPane.OK_OPTION:
+            return
+        
+        # 獲取列號
+        row_text = txt_row.getText().strip()
+        if not row_text:
+            JOptionPane.showMessageDialog(None, u"請輸入有效的列號", u"錯誤", JOptionPane.ERROR_MESSAGE)
+            return
+        
+        try:
+            row_num = int(row_text)
+            if row_num < 1:
+                raise ValueError("Row number must be >= 1")
+        except ValueError:
+            JOptionPane.showMessageDialog(None, u"列號必須是正整數", u"錯誤", JOptionPane.ERROR_MESSAGE)
+            return
+        
+        # 讀取 T 欄位內容
+        t_content = self._read_cell_t_column(row_num)
+        
+        if not t_content or not t_content.strip():
+            JOptionPane.showMessageDialog(
+                None, 
+                u"列 " + str(row_num) + u" 的 T 欄位為空或無法讀取", 
+                u"錯誤", 
+                JOptionPane.ERROR_MESSAGE
+            )
+            return
+        
+        # 解析 HTTP 請求內容並發送到 Repeater
+        try:
+            # 將內容轉換為 unicode 字串以便解析
+            request_str = safe_unicode_convert(t_content)
+            
+            # 將 unicode 字串轉為 UTF-8 bytes（sendToRepeater 需要 bytes）
+            request_bytes = request_str.encode('utf-8')
+            
+            # 解析請求行來提取 Host header
+            request_lines = request_str.split('\r\n')
+            if len(request_lines) == 1:
+                # 如果沒有 \r\n，嘗試 \n
+                request_lines = request_str.split('\n')
+            
+            if not request_lines or not request_lines[0].strip():
+                raise ValueError("Empty request")
+            
+            # 解析 Host header
+            host = None
+            port = 80
+            use_https = False
+            
+            for line in request_lines[1:]:
+                line = line.strip()
+                if not line:
+                    break  # 到達空行（header 結束）
+                if ':' in line:
+                    header_name, header_value = line.split(':', 1)
+                    header_name = header_name.strip().lower()
+                    header_value = header_value.strip()
+                    if header_name == 'host':
+                        host = header_value
+                        # 檢查是否有端口號
+                        if ':' in header_value:
+                            host, port_str = header_value.rsplit(':', 1)
+                            try:
+                                port = int(port_str)
+                                # 根據端口判斷是否為 HTTPS
+                                if port == 443:
+                                    use_https = True
+                                elif port == 80:
+                                    use_https = False
+                            except ValueError:
+                                # 端口解析失敗，預設使用 HTTPS
+                                use_https = True
+                                port = 443
+                        else:
+                            # 沒有端口號，檢查請求行中的 URL
+                            first_line = request_lines[0]
+                            if 'https://' in first_line or ':443' in first_line:
+                                use_https = True
+                                port = 443
+                            else:
+                                use_https = False
+                                port = 80
+                        break
+            
+            # 如果沒有找到 Host header，嘗試從請求行解析
+            if not host:
+                first_line = request_lines[0]
+                # 檢查請求行中的 URL
+                parts = first_line.split(' ')
+                if len(parts) >= 2:
+                    url_path = parts[1]
+                    if url_path.startswith('http://'):
+                        use_https = False
+                        url_part = url_path[7:]
+                        port = 80
+                    elif url_path.startswith('https://'):
+                        use_https = True
+                        url_part = url_path[8:]
+                        port = 443
+                    else:
+                        # 預設使用 HTTPS
+                        use_https = True
+                        url_part = url_path
+                        port = 443
+                    
+                    if '/' in url_part:
+                        host = url_part.split('/', 1)[0]
+                    else:
+                        host = url_part
+                    
+                    if ':' in host:
+                        host, port_str = host.rsplit(':', 1)
+                        try:
+                            port = int(port_str)
+                            if port == 443:
+                                use_https = True
+                            elif port == 80:
+                                use_https = False
+                        except:
+                            pass
+            
+            if not host:
+                raise ValueError("Unable to determine host from request. Please ensure the request contains a Host header or a full URL in the request line.")
+            
+            # 讀取 O 欄位（測試人員）資料
+            o_column_value = self._read_cell_value(row_num, "O")
+            
+            # 構建 tab 標題，包含 O 欄位資料
+            if o_column_value and o_column_value.strip():
+                tab_caption = u"Row " + str(row_num) + u" - " + o_column_value.strip() + u" - T Column"
+            else:
+                tab_caption = u"Row " + str(row_num) + u" - T Column"
+            
+            # 發送到 Repeater
+            self._callbacks.sendToRepeater(host, port, use_https, request_bytes, tab_caption)
+            
+            success_msg = u"已成功將列 " + str(row_num) + u" 的 T 欄位內容發送到 Repeater\n\nHost: " + host + u"\nPort: " + str(port) + u"\nHTTPS: " + (u"是" if use_https else u"否")
+            JOptionPane.showMessageDialog(None, success_msg, u"成功", JOptionPane.INFORMATION_MESSAGE)
+            
+        except Exception as e:
+            error_msg = u"解析或發送請求時發生錯誤: " + safe_unicode_convert(str(e))
+            print(("DEBUG: " + error_msg).encode('utf-8'))
+            import traceback
+            try:
+                traceback_str = traceback.format_exc()
+                print(("DEBUG: Traceback: " + traceback_str).encode('utf-8'))
+            except:
+                pass
+            JOptionPane.showMessageDialog(None, error_msg, u"錯誤", JOptionPane.ERROR_MESSAGE)
+
+    def post_to_custom_columns_api(self, data):
+        """將數據寫入自定義欄位"""
+        try:
+            # 確保 token 有效
+            if not self._ensure_valid_token():
+                error_msg = u"Token 無效且無法刷新，請手動獲取新 token"
+                print(("DEBUG: " + error_msg).encode('utf-8'))
+                from javax.swing import SwingUtilities
+                def show_error():
+                    JOptionPane.showMessageDialog(None, error_msg, u"錯誤", JOptionPane.ERROR_MESSAGE)
+                SwingUtilities.invokeLater(show_error)
+                return
+            
+            target_sheet = data["target_sheet"]
+            target_row = data["target_row"]
+            columns = data["columns"]
+            values = data["values"]
+            
+            # 構建範圍字符串（例如：分頁名稱!I5:L5）
+            target_sheet_unicode = safe_unicode_convert(target_sheet)
+            range_str = target_sheet_unicode + u"!" + columns[0] + safe_unicode_convert(str(target_row))
+            if len(columns) > 1:
+                range_str += u":" + columns[-1] + safe_unicode_convert(str(target_row))
+            
+            encoded_range = urllib.quote(range_str.encode('utf-8'))
+            
+            debug_msg = u"DEBUG: Preparing to write to custom columns, range: " + range_str
+            print(debug_msg.encode('utf-8'))
+            
+            api_url = "https://sheets.googleapis.com/v4/spreadsheets/{}/values/{}?valueInputOption=USER_ENTERED".format(
+                self.config["sheet_id"],
+                encoded_range
+            )
+            
+            debug_url = u"DEBUG: API URL: " + safe_unicode_convert(api_url)
+            print(debug_url.encode('utf-8'))
+            
+            json_data = json.dumps({"values": [values]})
+            
+            req = urllib2.Request(api_url, json_data)
+            req.add_header("Content-Type", "application/json")
+            req.add_header("Authorization", "Bearer " + self.config["access_token"])
+            
+            auth_method = self.config.get("auth_method", "gcloud")
+            if auth_method == "gcloud" and self.config.get("project_id"):
+                req.add_header("x-goog-user-project", self.config["project_id"])
+            
+            req.get_method = lambda: 'PUT'
+            
+            response = urllib2.urlopen(req)
+            response_body = response.read()
+            result = json.loads(response_body)
+            
+            if "updatedCells" in result:
+                columns_str = ",".join(columns)
+                success_msg = u"成功寫入到 " + safe_unicode_convert(target_sheet) + u" 行 " + str(target_row) + u" (欄位 " + columns_str + u")!"
+                print(safe_unicode_convert(success_msg).encode('utf-8'))
+                self._callbacks.issueAlert(safe_unicode_convert(success_msg))
+                from javax.swing import SwingUtilities
+                def show_success():
+                    JOptionPane.showMessageDialog(None, success_msg, u"成功", JOptionPane.INFORMATION_MESSAGE)
+                SwingUtilities.invokeLater(show_success)
+            else:
+                error_msg = u"寫入失敗: " + safe_unicode_convert(json.dumps(result))
+                print(("DEBUG: " + error_msg).encode('utf-8'))
+                
+        except urllib2.HTTPError as e:
+            error_code = e.code
+            error_body = e.read()
+            
+            if error_code == 401:
+                # 嘗試刷新 token 並重試
+                if self._ensure_valid_token():
+                    try:
+                        req_retry = urllib2.Request(api_url, json_data)
+                        req_retry.add_header("Content-Type", "application/json")
+                        req_retry.add_header("Authorization", "Bearer " + self.config["access_token"])
+                        auth_method = self.config.get("auth_method", "gcloud")
+                        if auth_method == "gcloud" and self.config.get("project_id"):
+                            req_retry.add_header("x-goog-user-project", self.config["project_id"])
+                        req_retry.get_method = lambda: 'PUT'
+                        
+                        response_retry = urllib2.urlopen(req_retry)
+                        response_body_retry = response_retry.read()
+                        result_retry = json.loads(response_body_retry)
+                        
+                        if "updatedCells" in result_retry:
+                            columns_str = ",".join(columns)
+                            success_msg = u"Token 刷新後重試成功！成功寫入到 " + safe_unicode_convert(target_sheet) + u" 行 " + str(target_row) + u" (欄位 " + columns_str + u")!"
+                            print(safe_unicode_convert(success_msg).encode('utf-8'))
+                            self._callbacks.issueAlert(safe_unicode_convert(success_msg))
+                            from javax.swing import SwingUtilities
+                            def show_success():
+                                JOptionPane.showMessageDialog(None, success_msg, u"成功", JOptionPane.INFORMATION_MESSAGE)
+                            SwingUtilities.invokeLater(show_success)
+                            return
+                    except:
+                        pass
+            
+            error_body_str = safe_unicode_convert(error_body)
+            error_msg = u"寫入失敗: HTTP " + str(error_code) + u" - " + error_body_str[:200]
+            print(("DEBUG: " + error_msg).encode('utf-8'))
+            from javax.swing import SwingUtilities
+            def show_error():
+                JOptionPane.showMessageDialog(None, error_msg, u"錯誤", JOptionPane.ERROR_MESSAGE)
+            SwingUtilities.invokeLater(show_error)
+        except Exception as e:
+            error_msg = u"寫入時發生錯誤: " + safe_unicode_convert(str(e))
+            print(("DEBUG: " + error_msg).encode('utf-8'))
+            from javax.swing import SwingUtilities
+            def show_error():
+                JOptionPane.showMessageDialog(None, error_msg, u"錯誤", JOptionPane.ERROR_MESSAGE)
+            SwingUtilities.invokeLater(show_error)
 
     def post_to_api(self, data):
         try:
