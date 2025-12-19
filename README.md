@@ -229,6 +229,56 @@ gcloud auth application-default print-access-token
 - 如果 token 已過期，系統會根據配置的認證方式自動刷新 token
 - 如果自動刷新失敗，請手動在配置對話框中重新獲取 token
 
+## 更新日誌
+
+### 近期變動（2025年12月）
+
+#### 新增功能
+
+1. **Read T to Repeater 功能**
+   - 新增菜單項：`[G-Sheet] Read T to Repeater`
+   - 功能：讀取 Google Sheets 中指定列的 T 欄位內容，並自動發送到 Burp Suite Repeater
+   - 特點：
+     - 自動解析 HTTP 請求中的 Host、Port、HTTPS 資訊
+     - Tab 標題會顯示行號和 O 欄位（測試人員）的值，方便識別
+     - 支援認證方式選擇（首次使用時）
+   - 使用方式：右鍵點擊 → 選擇 `[G-Sheet] Read T to Repeater` → 輸入列號 → 自動發送到 Repeater
+
+2. **Send to Custom Columns 功能**
+   - 新增菜單項：`[G-Sheet] Send to Custom Columns`
+   - 配置菜單項：`[G-Sheet] Custom Columns Configuration`
+   - 功能：可自定義 Sheet 分頁名稱和欄位（如 I,J,K,L），將數據寫入指定欄位
+   - 特點：
+     - 配置持久化：設置會保存到本地，下次使用時自動載入
+     - 自動讀取欄位標題：從第一列讀取欄位名稱並顯示在輸入框中
+     - 覆蓋確認：寫入前會顯示表單名稱、原有值和新值，確認後才執行覆寫
+   - 使用方式：
+     1. 首次使用：右鍵點擊 → 選擇 `[G-Sheet] Custom Columns Configuration` → 設置分頁名稱和欄位
+     2. 使用功能：右鍵點擊 → 選擇 `[G-Sheet] Send to Custom Columns` → 輸入數據 → 確認覆蓋
+
+#### 功能改進
+
+3. **T 欄位寫入邏輯改進**
+   - 修正：T 欄位現在使用 Burp Suite 最初取得的原始請求內容
+   - 不再使用使用者修改後的 K 欄位內容
+   - 目的：保持原始請求記錄的完整性
+
+4. **Nickname 處理改進**
+   - 支援逗號分隔格式：`"nickname": "iok,iok123"` → 自動取第一個值 `"iok"`
+   - 支援陣列格式：如果是陣列，也自動取第一個元素
+   - 應用場景：從 API 查詢獲取的 nickname 用於預設測試人員（O 欄位）
+
+5. **gcloud Token 刷新機制改進**
+   - 問題修復：JSON 文件中過期的 token 現在會自動更新
+   - 改進：在載入 token 文件時，如果檢測到 token 過期，會自動調用 gcloud 命令獲取新 token
+   - 效果：確保文件中不會保留過期的 token，提升使用體驗
+
+#### 技術改進
+
+- 新增多個工具方法，提升代碼重用性
+- 改進錯誤處理和用戶提示
+- 優化配置管理邏輯
+
 ## 更多資訊
 
 詳細的技術文檔、錯誤處理、程式結構等說明，請參閱 [WIKI.md](WIKI.md)。
