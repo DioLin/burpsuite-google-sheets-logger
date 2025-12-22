@@ -2673,6 +2673,65 @@ class BurpExtender(IBurpExtender, IContextMenuFactory):
             t = threading.Thread(target=self.post_to_custom_columns_api, args=(data,))
             t.start()
 
+    def _read_ad_columns_for_dropdown(self, sheet_name=None):
+        """讀取 A 欄、D 欄和 O 欄的數據，用於下拉選單（只包含 O 欄有值的行）"""
+        try:
+            if not self.config.get("sheet_id"):
+                return []
+            
+            if not self.config.get("access_token"):
+                return []
+            
+            if not self._ensure_valid_token():
+                return []
+            
+            # 如果沒有指定 sheet_name，使用默認的
+            if sheet_name is None:
+                target_sheet = self.config.get("sheet_name", u"弱點清單")
+            else:
+                target_sheet = sheet_name
+            
+            sheet_id = self.config.get("sheet_id", "")
+            target_sheet_unicode = safe_unicode_convert(target_sheet)
+            
+            # 讀取 A:D 和 O 欄位的數據（A:O 範圍，假設最多讀取 1000 行）
+            # O 欄是第 15 欄（A=1, B=2, ..., O=15）
+            range_str = target_sheet_unicode + u"!A2:O1000"  # 從第2行開始（第1行通常是標題）
+            encoded_range = urllib.quote(range_str.encode('utf-8'))
+            
+            api_url = "https://sheets.googleapis.com/v4/spreadsheets/{}/values/{}".format(
+                sheet_id,
+                encoded_range
+            )
+            
+            req = urllib2.Request(api_url)
+            req.add_header("Authorization", "Bearer " + self.config["access_token"])
+            auth_method = self.config.get("auth_method", "gcloud")
+            if auth_method == "gcloud" and self.config.get("project_id"):
+                req.add_header("x-goog-user-project", self.config["project_id"])
+            
+            response = urllib2.urlopen(req)
+            response_body = response.read()
+            response_body_str = safe_unicode_convert(response_body)
+            result = json.loads(response_body_str)
+            
+            items = []
+            if "values" in result:
+                for idx, row in enumerate(result["values"], start=2):  # 從第2行開始
+                    a_value = safe_unicode_convert(row[0] if len(row) > 0 and row[0] else "").strip()
+                    d_value = safe_unicode_convert(row[3] if len(row) > 3 and row[3] else "").strip()
+                    o_value = safe_unicode_convert(row[14] if len(row) > 14 and row[14] else "").strip()  # O 欄是索引 14（從0開始）
+                    
+                    # 只包含 O 欄有值的行（O 欄是測試人員）
+                    if o_value:
+                        display_text = u"項次:" + a_value + u"弱點:" + d_value + u" 測試人員:" + o_value
+                        items.append((display_text, idx))  # (顯示文字, 行號)
+            
+            return items
+        except Exception as e:
+            print(("DEBUG: Error reading A/D/O columns: " + safe_unicode_convert(str(e))).encode('utf-8'))
+            return []
+
     def read_t_to_repeater(self, event):
         """讀取指定列的 T 欄位內容並發送到 Burp Suite Repeater"""
         # 檢查是否有任何配置文件存在
@@ -2698,12 +2757,30 @@ class BurpExtender(IBurpExtender, IContextMenuFactory):
             else:
                 if not self.show_gcloud_config_dialog(): return
         
-        # 顯示對話框讓用戶輸入列號
+        # 讀取 A 欄和 D 欄的數據
+        target_sheet = self.config.get("sheet_name", u"弱點清單")
+        dropdown_items = self._read_ad_columns_for_dropdown(target_sheet)
+        
+        if not dropdown_items:
+            JOptionPane.showMessageDialog(
+                None,
+                u"無法讀取數據或沒有可用的項目",
+                u"錯誤",
+                JOptionPane.ERROR_MESSAGE
+            )
+            return
+        
+        # 構建下拉選單選項
+        combo_items = [item[0] for item in dropdown_items]  # 只取顯示文字
+        combo_items.insert(0, u"請選擇項目")  # 添加預設選項
+        
+        # 顯示對話框讓用戶選擇
         panel = JPanel()
         panel.setLayout(BoxLayout(panel, BoxLayout.Y_AXIS))
-        txt_row = JTextField("", 10)
-        panel.add(JLabel(u"請輸入要讀取的列號 (行號):"))
-        panel.add(txt_row)
+        combo_selection = JComboBox(combo_items)
+        combo_selection.setSelectedIndex(0)
+        panel.add(JLabel(u"請選擇要讀取的項目:"))
+        panel.add(combo_selection)
         
         result = JOptionPane.showConfirmDialog(
             None, 
@@ -2715,19 +2792,14 @@ class BurpExtender(IBurpExtender, IContextMenuFactory):
         if result != JOptionPane.OK_OPTION:
             return
         
-        # 獲取列號
-        row_text = txt_row.getText().strip()
-        if not row_text:
-            JOptionPane.showMessageDialog(None, u"請輸入有效的列號", u"錯誤", JOptionPane.ERROR_MESSAGE)
+        # 獲取選擇的項目
+        selected_index = combo_selection.getSelectedIndex()
+        if selected_index == 0:  # 選擇了預設選項
+            JOptionPane.showMessageDialog(None, u"請選擇一個項目", u"錯誤", JOptionPane.ERROR_MESSAGE)
             return
         
-        try:
-            row_num = int(row_text)
-            if row_num < 1:
-                raise ValueError("Row number must be >= 1")
-        except ValueError:
-            JOptionPane.showMessageDialog(None, u"列號必須是正整數", u"錯誤", JOptionPane.ERROR_MESSAGE)
-            return
+        # 獲取對應的行號（selected_index - 1 因為有預設選項，dropdown_items 索引從 0 開始）
+        row_num = dropdown_items[selected_index - 1][1]
         
         # 讀取 T 欄位內容
         t_content = self._read_cell_t_column(row_num)
@@ -2838,14 +2910,18 @@ class BurpExtender(IBurpExtender, IContextMenuFactory):
             if not host:
                 raise ValueError("Unable to determine host from request. Please ensure the request contains a Host header or a full URL in the request line.")
             
-            # 讀取 O 欄位（測試人員）資料
+            # 讀取 A、D、O 欄位資料，用於構建 tab 標題（與下拉選單格式一致）
+            a_column_value = self._read_cell_value(row_num, "A")
+            d_column_value = self._read_cell_value(row_num, "D")
             o_column_value = self._read_cell_value(row_num, "O")
             
-            # 構建 tab 標題，包含 O 欄位資料
-            if o_column_value and o_column_value.strip():
-                tab_caption = u"Row " + str(row_num) + u" - " + o_column_value.strip() + u" - T Column"
-            else:
-                tab_caption = u"Row " + str(row_num) + u" - T Column"
+            # 構建 tab 標題，格式與下拉選單一致：項次:{A欄值}弱點:{D欄值} 測試人員:{O欄值}
+            a_value = a_column_value.strip() if a_column_value else u""
+            d_value = d_column_value.strip() if d_column_value else u""
+            o_value = o_column_value.strip() if o_column_value else u""
+            
+            # 格式：項次:1弱點:SQL injection 測試人員:John Doe
+            tab_caption = u"項次:" + a_value + u"弱點:" + d_value + u" 測試人員:" + o_value
             
             # 發送到 Repeater
             self._callbacks.sendToRepeater(host, port, use_https, request_bytes, tab_caption)
